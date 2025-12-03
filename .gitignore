@@ -35,7 +35,8 @@ wheels/
 *~
 
 # Data and models
-data/
+# Only ignore root-level data/ directory, not src/data/ (which contains source code)
+/data/
 models/*.joblib
 models/*.pkl
 models/*.json

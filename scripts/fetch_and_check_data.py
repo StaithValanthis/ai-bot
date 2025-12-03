@@ -10,16 +10,133 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from loguru import logger
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add src to path - ensure absolute path regardless of CWD
+_script_file = os.path.abspath(__file__)
+_script_dir = os.path.dirname(_script_file)
+_project_root = os.path.dirname(_script_dir)  # scripts/ -> project root
 
-from src.config.config_loader import load_config
-from src.data.historical_data import HistoricalDataCollector
-from src.data.quality_checks import DataQualityChecker
+# Verify src module exists before adding to path
+# Use absolute paths to avoid any relative path issues
+_src_path = os.path.abspath(os.path.join(_project_root, "src"))
+if not os.path.isdir(_src_path):
+    # Fallback: try current working directory
+    _cwd = os.getcwd()
+    _cwd_src = os.path.abspath(os.path.join(_cwd, "src"))
+    if os.path.isdir(_cwd_src):
+        _project_root = os.path.abspath(_cwd)
+        _src_path = _cwd_src
+    else:
+        print(f"ERROR: Could not find src directory.", file=sys.stderr)
+        print(f"  Script dir: {_script_dir}", file=sys.stderr)
+        print(f"  Project root: {_project_root}", file=sys.stderr)
+        print(f"  Expected src at: {os.path.abspath(os.path.join(_project_root, 'src'))}", file=sys.stderr)
+        print(f"  Current working directory: {_cwd}", file=sys.stderr)
+        print(f"  Tried CWD src at: {_cwd_src}", file=sys.stderr)
+        sys.exit(1)
+
+# Ensure project_root is absolute
+_project_root = os.path.abspath(_project_root)
+
+# Verify critical subdirectories exist (use absolute path)
+_src_data_path = os.path.abspath(os.path.join(_src_path, "data"))
+if not os.path.isdir(_src_data_path):
+    print(f"ERROR: src/data directory does not exist!", file=sys.stderr)
+    print(f"  Expected at: {_src_data_path}", file=sys.stderr)
+    print(f"  Project root: {_project_root}", file=sys.stderr)
+    print(f"  src path: {_src_path}", file=sys.stderr)
+    print(f"  src path is absolute: {os.path.isabs(_src_path)}", file=sys.stderr)
+    print(f"  src path exists: {os.path.isdir(_src_path)}", file=sys.stderr)
+    if os.path.isdir(_src_path):
+        try:
+            contents = os.listdir(_src_path)
+            print(f"  Contents of src/: {contents}", file=sys.stderr)
+            # Check if 'data' is in the list but not a directory
+            if 'data' in contents:
+                data_item_path = os.path.join(_src_path, 'data')
+                print(f"  'data' found in src/, isdir: {os.path.isdir(data_item_path)}, isfile: {os.path.isfile(data_item_path)}", file=sys.stderr)
+        except Exception as e:
+            print(f"  Could not list src/ contents: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# Verify __init__.py files exist (Python packages)
+_src_init = os.path.join(_src_path, "__init__.py")
+_src_data_init = os.path.join(_src_data_path, "__init__.py")
+if not os.path.isfile(_src_init):
+    print(f"WARNING: src/__init__.py not found at {_src_init}", file=sys.stderr)
+if not os.path.isfile(_src_data_init):
+    print(f"WARNING: src/data/__init__.py not found at {_src_data_init}", file=sys.stderr)
+
+# CRITICAL: Remove script directory from sys.path if present
+# Python automatically adds the script's directory to sys.path[0], which causes
+# issues when the script is in a subdirectory (like scripts/)
+# We need to check both the exact path and normalize paths for comparison
+_script_dir_normalized = os.path.normpath(_script_dir)
+_project_root_normalized = os.path.normpath(_project_root)
+
+# Remove script directory from sys.path (check all entries)
+sys.path = [p for p in sys.path if os.path.normpath(p) != _script_dir_normalized]
+
+# Ensure project root is at sys.path[0] (highest priority)
+# Remove it first if it exists elsewhere
+sys.path = [p for p in sys.path if os.path.normpath(p) != _project_root_normalized]
+sys.path.insert(0, _project_root)
+
+# Clear any cached src modules
+import importlib
+modules_to_remove = [m for m in list(sys.modules.keys()) if m.startswith('src')]
+for m in modules_to_remove:
+    del sys.modules[m]
+
+# Verify path setup before importing
+if os.getenv('DEBUG_IMPORTS'):
+    print(f"DEBUG: Path setup complete", file=sys.stderr)
+    print(f"  Script dir: {_script_dir}", file=sys.stderr)
+    print(f"  Project root: {_project_root}", file=sys.stderr)
+    print(f"  sys.path[0:3]: {sys.path[:3]}", file=sys.stderr)
+    print(f"  src path exists: {os.path.isdir(_src_path)}", file=sys.stderr)
+
+# Now import
+try:
+    # Test import of src package first
+    import src
+    if not hasattr(src, '__path__'):
+        raise ImportError("src is not a package")
+    
+    # Now import the modules we need
+    from src.config.config_loader import load_config
+    from src.data.historical_data import HistoricalDataCollector
+    from src.data.quality_checks import DataQualityChecker
+except ImportError as e:
+    print(f"ERROR: Cannot import src modules. Path setup may have failed.", file=sys.stderr)
+    print(f"  Script dir: {_script_dir}", file=sys.stderr)
+    print(f"  Project root: {_project_root}", file=sys.stderr)
+    print(f"  CWD: {os.getcwd()}", file=sys.stderr)
+    print(f"  sys.path[0:3]: {sys.path[:3]}", file=sys.stderr)
+    print(f"  _src_path: {_src_path}", file=sys.stderr)
+    print(f"  src path exists: {os.path.isdir(_src_path)}", file=sys.stderr)
+    if os.path.isdir(_src_path):
+        try:
+            src_contents = os.listdir(_src_path)
+            print(f"  Contents of src/: {src_contents}", file=sys.stderr)
+        except Exception as list_err:
+            print(f"  Could not list src/ contents: {list_err}", file=sys.stderr)
+    data_path = os.path.join(_src_path, 'data')
+    print(f"  Expected src/data path: {data_path}", file=sys.stderr)
+    print(f"  src/data exists: {os.path.isdir(data_path)}", file=sys.stderr)
+    if os.path.isdir(data_path):
+        try:
+            data_contents = os.listdir(data_path)
+            print(f"  Contents of src/data/: {data_contents}", file=sys.stderr)
+        except Exception as list_err:
+            print(f"  Could not list src/data/ contents: {list_err}", file=sys.stderr)
+    print(f"  Error: {e}", file=sys.stderr)
+    sys.exit(1)
+
 import pandas as pd
 
 

@@ -45,16 +45,43 @@ if not os.path.isdir(_src_path) or not os.path.isfile(_src_init):
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-# Verify we can import src
+# Verify we can import src - clear cache first to avoid stale imports
+import importlib
+# Clear any cached src modules
+modules_to_remove = [m for m in list(sys.modules.keys()) if m.startswith('src')]
+for m in modules_to_remove:
+    del sys.modules[m]
+
 try:
+    # Import src package normally - Python should find it via sys.path
     import src
     if not hasattr(src, '__path__'):
         raise ImportError("src is not a package")
+    
+    # Verify src.data submodule directory exists (Python 3.3+ can import packages without __init__.py)
+    data_dir = os.path.join(_src_path, 'data')
+    if not os.path.isdir(data_dir):
+        raise ImportError(f"src/data directory not found at {data_dir}")
+    
+    # Import the submodule - this should work if src is in sys.path
+    # Python 3.3+ supports namespace packages, so __init__.py is optional
+    import src.data
 except ImportError as e:
     print(f"ERROR: Cannot import src module. Path setup may have failed.", file=sys.stderr)
     print(f"  Script dir: {_script_dir}", file=sys.stderr)
-    print(f"  sys.path[0]: {sys.path[0] if sys.path else 'empty'}", file=sys.stderr)
+    print(f"  CWD: {os.getcwd()}", file=sys.stderr)
+    print(f"  sys.path[0:3]: {sys.path[:3]}", file=sys.stderr)
+    print(f"  src path exists: {os.path.isdir(_src_path)}", file=sys.stderr)
+    print(f"  src/__init__.py exists: {os.path.isfile(_src_init)}", file=sys.stderr)
+    data_init = os.path.join(_src_path, 'data', '__init__.py')
+    print(f"  src/data/__init__.py exists: {os.path.isfile(data_init)}", file=sys.stderr)
+    if os.path.isdir(_src_path):
+        try:
+            print(f"  Contents of src/: {os.listdir(_src_path)}", file=sys.stderr)
+        except:
+            pass
     print(f"  Error: {e}", file=sys.stderr)
+    print(f"  Try: Ensure you're running from the repo root and src/ directory exists", file=sys.stderr)
     sys.exit(1)
 
 from src.config.config_loader import load_config
