@@ -293,4 +293,3 @@ class HistoricalDataCollector:
             self.save_candles(df, data_path)
         
         return df
-
