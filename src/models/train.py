@@ -50,7 +50,9 @@ class ModelTrainer:
         self.config = config
         self.feature_calc = FeatureCalculator(config)
         self.primary_signal_gen = PrimarySignalGenerator(config)
-        logger.info("Initialized ModelTrainer")
+        self.training_mode = config.get('model', {}).get('training_mode', 'single_symbol')
+        self.symbol_encoding_type = config.get('model', {}).get('symbol_encoding', 'one_hot')
+        logger.info(f"Initialized ModelTrainer (training_mode={self.training_mode})")
     
     def prepare_data(
         self,
@@ -174,6 +176,106 @@ class ModelTrainer:
         logger.info(f"Generated {len(features_df)} training samples (positive: {labels_series.sum()}, negative: {len(labels_series) - labels_series.sum()})")
         
         return features_df, labels_series
+    
+    def prepare_multi_symbol_data(
+        self,
+        symbol_dataframes: Dict[str, pd.DataFrame],  # {symbol: df}
+        hold_periods: int = 4,
+        profit_threshold: float = 0.005,
+        fee_rate: float = 0.0005,
+        use_triple_barrier: bool = True,
+        profit_barrier: float = 0.02,
+        loss_barrier: float = 0.01,
+        time_barrier_hours: int = 24,
+        base_slippage: float = 0.0001,
+        include_funding: bool = True,
+        funding_rate: float = 0.0001
+    ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, List[float]]]:
+        """
+        Prepare training data from multiple symbols with symbol encoding.
+        
+        Args:
+            symbol_dataframes: Dictionary mapping symbol to DataFrame
+            (other args same as prepare_data)
+            
+        Returns:
+            Tuple of (features_df, labels_series, symbol_encoding_map)
+            symbol_encoding_map: {symbol: [one_hot_encoding]} for use during live prediction
+        """
+        logger.info(f"Preparing multi-symbol training data for {len(symbol_dataframes)} symbols")
+        
+        # Create symbol encoding map
+        symbols = sorted(symbol_dataframes.keys())
+        symbol_encoding_map = {}
+        
+        if self.symbol_encoding_type == 'one_hot':
+            # One-hot encoding: N symbols -> N-1 features (last symbol is reference)
+            for i, sym in enumerate(symbols):
+                encoding = [0.0] * (len(symbols) - 1)
+                if i < len(symbols) - 1:  # Last symbol is reference (all zeros)
+                    encoding[i] = 1.0
+                symbol_encoding_map[sym] = encoding
+        elif self.symbol_encoding_type == 'index':
+            # Simple index encoding: symbol index normalized to [0, 1]
+            for i, sym in enumerate(symbols):
+                symbol_encoding_map[sym] = [float(i) / max(len(symbols) - 1, 1)]
+        else:
+            # Default: one-hot
+            for i, sym in enumerate(symbols):
+                encoding = [0.0] * (len(symbols) - 1)
+                if i < len(symbols) - 1:
+                    encoding[i] = 1.0
+                symbol_encoding_map[sym] = encoding
+        
+        logger.info(f"Symbol encoding ({self.symbol_encoding_type}): {len(symbol_encoding_map)} symbols, {len(symbol_encoding_map[symbols[0]])} encoding features")
+        
+        # Prepare data for each symbol
+        all_features = []
+        all_labels = []
+        
+        for symbol, df in symbol_dataframes.items():
+            logger.info(f"Processing {symbol}: {len(df)} candles")
+            
+            # Use existing prepare_data method but add symbol encoding
+            features_df, labels_series = self.prepare_data(
+                df=df,
+                symbol=symbol,
+                hold_periods=hold_periods,
+                profit_threshold=profit_threshold,
+                fee_rate=fee_rate,
+                use_triple_barrier=use_triple_barrier,
+                profit_barrier=profit_barrier,
+                loss_barrier=loss_barrier,
+                time_barrier_hours=time_barrier_hours,
+                base_slippage=base_slippage,
+                include_funding=include_funding,
+                funding_rate=funding_rate
+            )
+            
+            if features_df.empty:
+                logger.warning(f"No training samples for {symbol}, skipping")
+                continue
+            
+            # Add symbol encoding to features
+            encoding = symbol_encoding_map[symbol]
+            for i, val in enumerate(encoding):
+                features_df[f'symbol_id_{i}'] = val
+            
+            all_features.append(features_df)
+            all_labels.append(labels_series)
+        
+        if not all_features:
+            logger.error("No training samples generated from any symbol")
+            return pd.DataFrame(), pd.Series(dtype=int), {}
+        
+        # Combine all features and labels
+        combined_features = pd.concat(all_features, ignore_index=True)
+        combined_labels = pd.concat(all_labels, ignore_index=True)
+        
+        logger.info(f"Combined multi-symbol dataset: {len(combined_features)} samples from {len(symbol_dataframes)} symbols")
+        logger.info(f"  Positive labels: {combined_labels.sum()}, Negative: {len(combined_labels) - combined_labels.sum()}")
+        
+        return combined_features, combined_labels, symbol_encoding_map
     
     def _triple_barrier_exit(
         self,
@@ -306,7 +408,7 @@ class ModelTrainer:
             X_train_scaled,
             y_train,
             eval_set=[(X_val_scaled, y_val)],
-            early_stopping_rounds=10,
+            early_stopping_rounds=10,  # Must be passed to fit() to function properly
             verbose=False
         )
         
@@ -411,13 +513,39 @@ class ModelTrainer:
         joblib.dump(scaler, scaler_path)
         logger.info(f"Saved scaler to {scaler_path}")
         
-        # Save config
+        # Save config with model coverage metadata
         config = {
             'version': version,
             'training_date': datetime.utcnow().isoformat(),
             'features': list(features_df.columns),
-            'performance': metrics
+            'performance': metrics,
+            'training_mode': self.training_mode,
+            'symbol_encoding_type': self.symbol_encoding_type
         }
+        
+        # Add model coverage metadata
+        if hasattr(self, 'trained_symbols') and self.trained_symbols:
+            config['trained_symbols'] = self.trained_symbols
+            logger.info(f"Saved trained_symbols: {self.trained_symbols}")
+        
+        if hasattr(self, 'training_days') and self.training_days:
+            config['training_days'] = self.training_days
+        
+        if hasattr(self, 'training_end_timestamp') and self.training_end_timestamp:
+            config['training_end_timestamp'] = self.training_end_timestamp.isoformat() if hasattr(self.training_end_timestamp, 'isoformat') else str(self.training_end_timestamp)
+        
+        if hasattr(self, 'min_history_days_per_symbol') and self.min_history_days_per_symbol:
+            config['min_history_days_per_symbol'] = self.min_history_days_per_symbol
+        
+        # Add per-symbol history days if available (for multi-symbol models)
+        if hasattr(self, 'symbol_history_days') and self.symbol_history_days:
+            config['symbol_history_days'] = self.symbol_history_days
+            logger.info(f"Saved per-symbol history days: {self.symbol_history_days}")
+        
+        # Add symbol encoding map if multi-symbol training
+        if hasattr(self, 'symbol_encoding_map') and self.symbol_encoding_map:
+            config['symbol_encoding_map'] = self.symbol_encoding_map
+            logger.info(f"Saved symbol encoding map for {len(self.symbol_encoding_map)} symbols")
         
         config_path = model_dir / f"model_config_v{version}.json"
         with open(config_path, 'w') as f:

@@ -187,11 +187,35 @@ def fetch_and_check(
         
         # Check if we need to update
         latest_date = existing_data['timestamp'].max()
+        earliest_date = existing_data['timestamp'].min()
         days_old = (datetime.utcnow() - latest_date).days
+        days_of_history = (latest_date - earliest_date).days
+        required_days = years * 365
         
-        if days_old < 1:
-            logger.info("Data is recent, skipping download")
+        if days_old < 1 and days_of_history >= required_days:
+            logger.info(f"Data is recent and has sufficient history ({days_of_history} days >= {required_days} days), skipping download")
             df = existing_data
+        elif days_of_history < required_days:
+            # Need to fetch more history
+            logger.info(f"Existing data has {days_of_history} days, but need {required_days} days. Fetching additional history...")
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=required_days)
+            
+            new_data = data_collector.fetch_candles(
+                symbol=symbol,
+                interval=timeframe,
+                start_time=start_time,
+                end_time=end_time
+            )
+            
+            if not new_data.empty:
+                # Merge with existing
+                df = pd.concat([existing_data, new_data], ignore_index=True)
+                df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
+                df = df.reset_index(drop=True)
+                logger.info(f"Updated data: {len(df)} total candles")
+            else:
+                df = existing_data
         else:
             logger.info(f"Data is {days_old} days old, updating...")
             # Download only missing data

@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, List
+from datetime import datetime
 from loguru import logger
 from sklearn.preprocessing import StandardScaler
 
@@ -56,12 +57,58 @@ class MetaPredictor:
                 with open(self.config_path, 'r') as f:
                     self.config = json.load(f)
                 self.feature_names = self.config.get('features', [])
+                # Store symbol encoding map if available (for multi-symbol models)
+                if 'symbol_encoding_map' in self.config:
+                    logger.info(f"Loaded symbol encoding map for {len(self.config['symbol_encoding_map'])} symbols")
             
             logger.info("Successfully loaded meta-model components")
             
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
+    
+    @property
+    def trained_symbols(self) -> List[str]:
+        """Get list of symbols used in training"""
+        symbols = self.config.get('trained_symbols', [])
+        if not symbols:
+            logger.warning("Model config missing 'trained_symbols' metadata (older model?)")
+        return symbols if isinstance(symbols, list) else []
+    
+    @property
+    def training_days(self) -> int:
+        """Get number of days of history used in training"""
+        days = self.config.get('training_days', 0)
+        if days == 0:
+            logger.warning("Model config missing 'training_days' metadata (older model?)")
+        return days
+    
+    @property
+    def training_mode(self) -> str:
+        """Get training mode: 'single_symbol' or 'multi_symbol'"""
+        return self.config.get('training_mode', 'single_symbol')
+    
+    @property
+    def training_end_timestamp(self) -> Optional[str]:
+        """Get last timestamp in training data"""
+        return self.config.get('training_end_timestamp', None)
+    
+    @property
+    def min_history_days_per_symbol(self) -> int:
+        """Get minimum history days per symbol requirement"""
+        return self.config.get('min_history_days_per_symbol', 730)
+    
+    def is_symbol_covered(self, symbol: str) -> bool:
+        """
+        Check if a symbol is covered by this model.
+        
+        Args:
+            symbol: Trading symbol to check
+            
+        Returns:
+            True if symbol is in trained_symbols, False otherwise
+        """
+        return symbol in self.trained_symbols
     
     def predict(self, features: Dict[str, float]) -> float:
         """

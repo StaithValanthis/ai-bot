@@ -57,18 +57,24 @@ class HistoricalDataCollector:
             DataFrame with OHLCV data
         """
         all_candles = []
-        current_start = start_time
+        # Paginate backwards from end_time to start_time
+        # Bybit returns candles in reverse chronological order (newest first)
+        current_end = end_time
+        end_ts = int(end_time.timestamp() * 1000) if end_time else None
+        start_ts = int(start_time.timestamp() * 1000) if start_time else None
         
         logger.info(f"Fetching candles for {symbol} from {start_time} to {end_time}")
         
         retry_count = 0
+        iteration = 0
         while True:
+            iteration += 1
             try:
-                # Convert datetime to timestamp (milliseconds)
-                start_ts = int(current_start.timestamp() * 1000) if current_start else None
-                end_ts = int(end_time.timestamp() * 1000) if end_time else None
+                # Convert current_end to timestamp (milliseconds)
+                current_end_ts = int(current_end.timestamp() * 1000) if current_end else None
                 
                 # Make API request with retry logic
+                # Request from start_time to current_end to get candles going backwards
                 response = None
                 for attempt in range(max_retries):
                     try:
@@ -76,8 +82,8 @@ class HistoricalDataCollector:
                             category="linear",
                             symbol=symbol,
                             interval=interval,
-                            start=start_ts,
-                            end=end_ts,
+                            start=start_ts,  # Always start from the original start_time
+                            end=current_end_ts,  # Move end backwards as we paginate
                             limit=limit
                         )
                         break
@@ -102,6 +108,7 @@ class HistoricalDataCollector:
                 candles = response.get('result', {}).get('list', [])
                 
                 if not candles:
+                    logger.info(f"No more candles returned, stopping pagination")
                     break
                 
                 # Convert to DataFrame
@@ -112,20 +119,59 @@ class HistoricalDataCollector:
                 for col in ['open', 'high', 'low', 'close', 'volume', 'turnover']:
                     df[col] = df[col].astype(float)
                 
+                # Bybit returns candles in reverse chronological order (newest first)
+                # Sort to chronological order for easier processing
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                
+                # Filter out candles that are outside our desired range (safety check)
+                if start_time:
+                    df = df[df['timestamp'] >= start_time]
+                if end_time:
+                    df = df[df['timestamp'] <= end_time]
+                
+                if df.empty:
+                    logger.info(f"Filtered out all candles, stopping pagination")
+                    break
+                
                 all_candles.append(df)
                 
-                # Update start time for next iteration
-                last_timestamp = df['timestamp'].iloc[-1]
-                if current_start and last_timestamp <= current_start:
+                # Get the oldest timestamp in this batch (first row after sorting)
+                oldest_timestamp = df['timestamp'].iloc[0]
+                newest_timestamp = df['timestamp'].iloc[-1]
+                
+                # Log progress (info level so user can see pagination working)
+                logger.info(f"Iteration {iteration}: Fetched {len(df)} candles, range: {oldest_timestamp} to {newest_timestamp} (total so far: {sum(len(c) for c in all_candles)})")
+                
+                # Check if we've reached or passed start_time
+                if start_time and oldest_timestamp <= start_time:
+                    logger.info(f"Reached start_time ({start_time}), stopping pagination")
                     break
                 
                 # Calculate interval delta based on interval string
                 interval_hours = self._interval_to_hours(interval)
-                current_start = last_timestamp + timedelta(hours=interval_hours)
                 
-                # Check if we've reached end_time
-                if end_time and current_start >= end_time:
+                # Move current_end backwards to the oldest candle we got (inclusive)
+                # Bybit will return candles up to and including this timestamp
+                # We'll filter duplicates when combining all_candles
+                current_end = oldest_timestamp
+                
+                # Safety check: if we got fewer candles than requested, we've likely reached the end
+                if len(candles) < limit:
+                    logger.info(f"Received fewer candles than requested ({len(candles)} < {limit}), stopping pagination")
                     break
+                
+                # Additional safety: if we've gone past start_time, we're done
+                if start_time and current_end < start_time:
+                    logger.info(f"Reached start_time ({start_time}), stopping pagination")
+                    break
+                
+                # Safety check: if oldest_timestamp didn't move backwards, we might be stuck
+                # (This should be rare, but helps avoid infinite loops)
+                if iteration > 1:
+                    prev_oldest = all_candles[-2]['timestamp'].iloc[0]
+                    if oldest_timestamp >= prev_oldest:
+                        logger.warning(f"Oldest timestamp didn't move backwards (current: {oldest_timestamp}, previous: {prev_oldest}), stopping pagination")
+                        break
                 
                 # Rate limiting (be more conservative)
                 time.sleep(0.2)
@@ -226,6 +272,51 @@ class HistoricalDataCollector:
         
         return filepath
     
+    @staticmethod
+    def calculate_history_metrics(df: pd.DataFrame, expected_interval_minutes: int = 60) -> dict:
+        """
+        Calculate history metrics for a DataFrame.
+        
+        Args:
+            df: DataFrame with 'timestamp' column
+            expected_interval_minutes: Expected interval between candles in minutes
+            
+        Returns:
+            Dictionary with:
+                - available_days: Actual number of days of history
+                - coverage_pct: Percentage of expected candles present
+                - total_candles: Total number of candles
+                - date_range: (start_date, end_date)
+        """
+        if df.empty or 'timestamp' not in df.columns:
+            return {
+                'available_days': 0,
+                'coverage_pct': 0.0,
+                'total_candles': 0,
+                'date_range': (None, None)
+            }
+        
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        start_date = pd.to_datetime(df['timestamp'].min())
+        end_date = pd.to_datetime(df['timestamp'].max())
+        
+        # Calculate actual days
+        available_days = (end_date - start_date).days
+        
+        # Calculate expected number of candles
+        expected_candles = (available_days * 24 * 60) / expected_interval_minutes
+        actual_candles = len(df)
+        
+        # Calculate coverage percentage
+        coverage_pct = (actual_candles / expected_candles) if expected_candles > 0 else 0.0
+        
+        return {
+            'available_days': available_days,
+            'coverage_pct': coverage_pct,
+            'total_candles': actual_candles,
+            'date_range': (start_date, end_date)
+        }
+    
     def load_candles(
         self,
         symbol: str,
@@ -246,11 +337,13 @@ class HistoricalDataCollector:
         data_dir = Path(data_path)
         
         # Find all matching files
-        pattern = f"{symbol}_{timeframe}_*.parquet"
+        # Match both {symbol}_{timeframe}.parquet and {symbol}_{timeframe}_*.parquet
+        # to support both current save format and any legacy files with suffixes
+        pattern = f"{symbol}_{timeframe}*.parquet"
         files = list(data_dir.glob(pattern))
         
         if not files:
-            logger.warning(f"No data files found for {symbol} {timeframe}")
+            logger.warning(f"No data files found for {symbol} {timeframe} in {data_path}")
             return pd.DataFrame()
         
         # Load and combine all files
@@ -262,7 +355,7 @@ class HistoricalDataCollector:
         result_df = pd.concat(dfs, ignore_index=True)
         result_df = result_df.sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
         
-        logger.info(f"Loaded {len(result_df)} candles for {symbol} {timeframe}")
+        logger.info(f"Loaded {len(result_df)} candles for {symbol} {timeframe} from {len(files)} file(s)")
         return result_df
     
     def download_and_save(
@@ -270,7 +363,8 @@ class HistoricalDataCollector:
         symbol: str,
         days: int = 730,
         interval: str = "60",
-        data_path: str = "data/historical"
+        data_path: str = "data/historical",
+        merge_existing: bool = True
     ) -> pd.DataFrame:
         """
         Download and save historical data.
@@ -280,16 +374,63 @@ class HistoricalDataCollector:
             days: Number of days of history to download
             interval: Kline interval
             data_path: Base path for data storage
+            merge_existing: If True, merge with existing data; if False, overwrite
             
         Returns:
             DataFrame with downloaded data
         """
+        # Check for existing data first
+        existing_df = self.load_candles(symbol, interval, data_path)
+        
+        if not existing_df.empty:
+            # Calculate what date range we already have
+            existing_start = existing_df['timestamp'].min()
+            existing_end = existing_df['timestamp'].max()
+            existing_days = (existing_end - existing_start).days
+            
+            logger.info(f"Found existing data for {symbol}: {len(existing_df)} candles from {existing_start.date()} to {existing_end.date()} ({existing_days} days)")
+            
+            # Check if we need to download more data
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+            
+            # If existing data covers the requested range, return it
+            if existing_start <= start_time and existing_end >= end_time - timedelta(days=1):
+                logger.info(f"Existing data already covers requested range ({days} days), skipping download")
+                return existing_df
+            
+            # Otherwise, download missing data
+            if existing_end < end_time - timedelta(days=1):
+                logger.info(f"Downloading missing data from {existing_end} to {end_time}")
+                new_df = self.fetch_candles(symbol, interval, existing_end, end_time)
+                if not new_df.empty:
+                    # Merge with existing
+                    combined = pd.concat([existing_df, new_df], ignore_index=True)
+                    combined = combined.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
+                    self.save_candles(combined, data_path, merge_existing=False)
+                    return combined
+            
+            # If we need older data
+            if existing_start > start_time:
+                logger.info(f"Downloading older data from {start_time} to {existing_start}")
+                older_df = self.fetch_candles(symbol, interval, start_time, existing_start)
+                if not older_df.empty:
+                    # Merge with existing
+                    combined = pd.concat([older_df, existing_df], ignore_index=True)
+                    combined = combined.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
+                    self.save_candles(combined, data_path, merge_existing=False)
+                    return combined
+            
+            return existing_df
+        
+        # No existing data, download fresh
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(days=days)
         
+        logger.info(f"Downloading {days} days of data for {symbol} from {start_time.date()} to {end_time.date()}")
         df = self.fetch_candles(symbol, interval, start_time, end_time)
         
         if not df.empty:
-            self.save_candles(df, data_path)
+            self.save_candles(df, data_path, merge_existing=merge_existing)
         
         return df

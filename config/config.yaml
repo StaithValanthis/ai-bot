@@ -32,8 +32,10 @@ trading:
 
 # Data Settings
 data:
-  historical_data_path: "data/raw/bybit"  # Path for historical OHLCV data
+  historical_data_path: "data/raw/bybit"  # Path for historical OHLCV data (Parquet files)
   data_quality_checks_enabled: true  # Enable quality checks on data load
+  min_history_days: 730  # 2 years minimum history
+  update_frequency: 3600  # 1 hour in seconds
 
 # Model Settings
 model:
@@ -44,6 +46,30 @@ model:
   confidence_threshold: 0.6
   use_ensemble: true  # Use ensemble (XGBoost + Logistic Regression baseline)
   ensemble_xgb_weight: 0.7  # Weight for XGBoost in ensemble (0.7 = 70% XGBoost, 30% baseline)
+  
+  # Model Architecture Options
+  # "single_symbol": Train on one symbol only (current default, backward compatible)
+  # "multi_symbol": Train on multiple symbols with symbol encoding (recommended)
+  training_mode: "single_symbol"  # "single_symbol" | "multi_symbol"
+  symbol_encoding: "one_hot"  # "one_hot" | "index" | "embedding" (only used if training_mode="multi_symbol")
+  multi_symbol_symbols: []  # Empty = use universe manager, or explicit list like ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+  
+  # New Symbol Onboarding
+  auto_train_new_symbols: true  # Automatically train new symbols when they appear in universe
+  block_untrained_symbols: true  # Block trading for symbols not in trained_symbols
+  
+  # History Requirements Policy
+  # Target history: Use up to this many days when available (preferred for robustness)
+  target_history_days: 730  # 2 years (use most recent N days if more available)
+  # Minimum history: Symbols with less than this are blocked from training/trading
+  min_history_days_to_train: 90  # 3 months minimum (recommended: 90-180 days)
+  # Coverage requirement: Minimum percentage of expected candles that must be present
+  min_history_coverage_pct: 0.95  # 95% data coverage required
+  # Block symbols with insufficient history (even if auto_train_new_symbols is true)
+  block_short_history_symbols: true  # Block symbols with < min_history_days_to_train
+  
+  # Deprecated (for backward compatibility, use target_history_days + min_history_days_to_train)
+  # required_history_days: 730  # DEPRECATED: Use target_history_days instead
 
 # Risk Management
 risk:
@@ -80,12 +106,6 @@ features:
     atr_period: 14
     bb_period: 20
     bb_std: 2
-
-# Data Settings
-data:
-  historical_data_path: "data/historical"
-  min_history_days: 730  # 2 years
-  update_frequency: 3600  # 1 hour in seconds
 
 # Logging
 logging:

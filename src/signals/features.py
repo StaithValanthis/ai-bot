@@ -111,13 +111,21 @@ class FeatureCalculator:
         
         return df
     
-    def build_meta_features(self, df: pd.DataFrame, primary_signal: dict) -> Dict[str, float]:
+    def build_meta_features(
+        self, 
+        df: pd.DataFrame, 
+        primary_signal: dict,
+        symbol: Optional[str] = None,
+        symbol_encoding: Optional[Dict[str, List[str]]] = None
+    ) -> Dict[str, float]:
         """
         Build feature vector for meta-model.
         
         Args:
             df: DataFrame with latest candle and indicators
             primary_signal: Dictionary with primary signal information
+            symbol: Trading symbol (optional, used for symbol encoding in multi-symbol mode)
+            symbol_encoding: Dict mapping symbol to one-hot encoding list (optional, used during training)
             
         Returns:
             Dictionary of feature values
@@ -184,6 +192,21 @@ class FeatureCalculator:
             timestamp = pd.to_datetime(latest['timestamp'])
             features['hour'] = timestamp.hour / 24.0  # Normalize to [0, 1]
             features['day_of_week'] = timestamp.dayofweek / 7.0  # Normalize to [0, 1]
+        
+        # Symbol encoding (for multi-symbol training)
+        # If symbol_encoding is provided (training mode), use it
+        # If symbol is provided (live mode), extract from df if available
+        if symbol_encoding is not None and symbol is not None:
+            # Training mode: use provided encoding
+            encoding = symbol_encoding.get(symbol, [])
+            for i, val in enumerate(encoding):
+                features[f'symbol_id_{i}'] = float(val)
+        elif symbol is not None and 'symbol_id' in df.columns:
+            # Live mode: extract from DataFrame if available
+            # This handles the case where symbol_id was added during data preparation
+            symbol_id_cols = [col for col in df.columns if col.startswith('symbol_id_')]
+            for col in symbol_id_cols:
+                features[col] = float(latest[col])
         
         return features
     

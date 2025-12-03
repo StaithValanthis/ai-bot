@@ -336,6 +336,78 @@ case "$PROFILE_CHOICE" in
         ;;
 esac
 
+# Model training mode selection
+log_info ""
+log_info "Model Training Mode:"
+echo "  [1] single_symbol (Train on one symbol, shared model - Recommended for first deployment)"
+echo "  [2] multi_symbol (Train on multiple symbols with symbol encoding - More robust)"
+echo ""
+TRAINING_MODE_CHOICE=$(prompt_input "Enter training mode [1-2]" "1")
+
+case "$TRAINING_MODE_CHOICE" in
+    1)
+        MODEL_TRAINING_MODE="single_symbol"
+        log_info "Selected: Single-symbol training mode"
+        ;;
+    2)
+        MODEL_TRAINING_MODE="multi_symbol"
+        log_info "Selected: Multi-symbol training mode"
+        ;;
+    *)
+        MODEL_TRAINING_MODE="single_symbol"
+        log_warn "Invalid choice, defaulting to single_symbol"
+        ;;
+esac
+
+# Symbol encoding (if multi_symbol)
+MODEL_SYMBOL_ENCODING="one_hot"
+MULTI_SYMBOL_SYMBOLS=""
+if [[ "$MODEL_TRAINING_MODE" == "multi_symbol" ]]; then
+    log_info ""
+    log_info "Symbol Encoding Method:"
+    echo "  [1] one_hot (Safer, more interpretable - Recommended)"
+    echo "  [2] index (Compact, less interpretable)"
+    echo ""
+    ENCODING_CHOICE=$(prompt_input "Enter encoding method [1-2]" "1")
+    
+    case "$ENCODING_CHOICE" in
+        1)
+            MODEL_SYMBOL_ENCODING="one_hot"
+            log_info "Selected: One-hot encoding"
+            ;;
+        2)
+            MODEL_SYMBOL_ENCODING="index"
+            log_info "Selected: Index encoding"
+            ;;
+        *)
+            MODEL_SYMBOL_ENCODING="one_hot"
+            log_warn "Invalid choice, defaulting to one_hot"
+            ;;
+    esac
+    
+    log_info ""
+    log_info "Multi-Symbol Training Configuration:"
+    echo "  [1] Use auto universe (discover symbols dynamically during training)"
+    echo "  [2] Specify core symbols manually (comma-separated, e.g., BTCUSDT,ETHUSDT,SOLUSDT)"
+    echo ""
+    MULTI_SYMBOL_CHOICE=$(prompt_input "Enter choice [1-2]" "1")
+    
+    case "$MULTI_SYMBOL_CHOICE" in
+        1)
+            MULTI_SYMBOL_SYMBOLS=""  # Empty = use universe
+            log_info "Selected: Use auto universe for training"
+            ;;
+        2)
+            MULTI_SYMBOL_SYMBOLS=$(prompt_input "Enter core symbols (comma-separated)" "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,LINKUSDT")
+            log_info "Selected: Manual symbol list: $MULTI_SYMBOL_SYMBOLS"
+            ;;
+        *)
+            MULTI_SYMBOL_SYMBOLS=""
+            log_warn "Invalid choice, defaulting to auto universe"
+            ;;
+    esac
+fi
+
 # Universe mode selection
 log_info ""
 log_info "Universe Discovery Mode:"
@@ -572,6 +644,9 @@ config_path = "$CONFIG_FILE"
 universe_mode = "$UNIVERSE_MODE"
 min_volume = "$UNIVERSE_MIN_VOLUME"
 max_symbols = "$UNIVERSE_MAX_SYMBOLS"
+training_mode = "$MODEL_TRAINING_MODE"
+symbol_encoding = "$MODEL_SYMBOL_ENCODING"
+multi_symbol_symbols = "$MULTI_SYMBOL_SYMBOLS"
 
 try:
     with open(config_path, 'r') as f:
@@ -590,14 +665,43 @@ try:
         if max_symbols:
             config['exchange']['max_symbols'] = int(max_symbols)
     
+    # Ensure model section exists
+    if 'model' not in config:
+        config['model'] = {}
+    
+    # Update model training settings
+    config['model']['training_mode'] = training_mode
+    config['model']['symbol_encoding'] = symbol_encoding
+    
+    if training_mode == 'multi_symbol' and multi_symbol_symbols:
+        # Parse comma-separated symbols into list
+        symbols_list = [s.strip() for s in multi_symbol_symbols.split(',') if s.strip()]
+        config['model']['multi_symbol_symbols'] = symbols_list
+    elif training_mode == 'multi_symbol':
+        # Empty list means use universe
+        config['model']['multi_symbol_symbols'] = []
+    
+    # Set new symbol onboarding defaults
+    config['model']['auto_train_new_symbols'] = True
+    config['model']['block_untrained_symbols'] = True
+    config['model']['target_history_days'] = 730  # Target: up to 2 years
+    config['model']['min_history_days_to_train'] = 90  # Minimum: 3 months
+    config['model']['min_history_coverage_pct'] = 0.95
+    config['model']['block_short_history_symbols'] = True
+    
     # Write back
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     
-    print(f"Updated config.yaml: universe_mode={universe_mode}")
+    print(f"Updated config.yaml:")
+    print(f"  universe_mode={universe_mode}")
     if universe_mode == 'auto':
         print(f"  min_usd_volume_24h={min_volume}")
         print(f"  max_symbols={max_symbols}")
+    print(f"  model.training_mode={training_mode}")
+    print(f"  model.symbol_encoding={symbol_encoding}")
+    if training_mode == 'multi_symbol' and multi_symbol_symbols:
+        print(f"  model.multi_symbol_symbols={multi_symbol_symbols}")
 except Exception as e:
     print(f"Warning: Could not update config.yaml: {e}", file=sys.stderr)
     sys.exit(1)
@@ -745,7 +849,30 @@ fi
 log_info ""
 log_info "Step 6: Optional initial setup steps"
 
-if prompt_yes_no "Do you want to fetch historical data now?" "N"; then
+# Check if data already exists before prompting
+DATA_EXISTS=false
+SKIP_DATA_FETCH=false  # Initialize to avoid unbound variable error
+if [[ -d "$SCRIPT_DIR/data/raw/bybit" ]] || [[ -d "$SCRIPT_DIR/data/historical" ]]; then
+    # Check for any parquet files
+    if find "$SCRIPT_DIR/data" -name "*.parquet" -type f 2>/dev/null | grep -q .; then
+        DATA_EXISTS=true
+        log_info "Found existing data files in data/ directory"
+    fi
+fi
+
+if [[ "$DATA_EXISTS" == "true" ]]; then
+    if prompt_yes_no "Historical data files already exist. Re-download anyway?" "N"; then
+        log_info "Re-downloading historical data..."
+        SKIP_DATA_FETCH=false  # User wants to re-download
+    else
+        log_info "Skipping data download (using existing data)"
+        SKIP_DATA_FETCH=true  # User wants to skip
+    fi
+else
+    SKIP_DATA_FETCH=false  # No data exists, can proceed
+fi
+
+if [[ "$SKIP_DATA_FETCH" != "true" ]] && prompt_yes_no "Do you want to fetch historical data now?" "N"; then
     log_info "Fetching historical data..."
     
     # If auto universe mode, let user choose symbols or use discovered ones
@@ -861,18 +988,24 @@ PYTHON_SCRIPT
 fi
 
 if prompt_yes_no "Do you want to train an initial model now?" "N"; then
-    log_info "Training initial model..."
+    log_info "Training initial model (mode: $MODEL_TRAINING_MODE)..."
     
-    if [[ "$UNIVERSE_MODE" == "auto" ]]; then
-        log_info "Auto universe mode: Discovering symbols for training..."
-        if [[ -d "$VENV_PATH" ]]; then
-            source "$VENV_PATH/bin/activate"
-            cd "$SCRIPT_DIR"
-            load_env_file "$SCRIPT_DIR/.env"
-            export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-            
-            # Discover symbols using UniverseManager
-            DISCOVERED_SYMBOLS=$(python3 <<PYTHON_SCRIPT
+    # Determine symbols based on training mode
+    if [[ "$MODEL_TRAINING_MODE" == "multi_symbol" ]]; then
+        # Multi-symbol: symbols already configured in config.yaml
+        SYMBOLS_TO_TRAIN=()  # Not used for multi-symbol
+    else
+        # Single-symbol: need to select one symbol
+        if [[ "$UNIVERSE_MODE" == "auto" ]]; then
+            log_info "Auto universe mode: Discovering symbols for training..."
+            if [[ -d "$VENV_PATH" ]]; then
+                source "$VENV_PATH/bin/activate"
+                cd "$SCRIPT_DIR"
+                load_env_file "$SCRIPT_DIR/.env"
+                export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+                
+                # Discover symbols using UniverseManager
+                DISCOVERED_SYMBOLS=$(python3 <<PYTHON_SCRIPT
 import sys
 import json
 from src.config.config_loader import load_config
@@ -888,56 +1021,57 @@ except Exception as e:
     sys.exit(1)
 PYTHON_SCRIPT
 )
-            
-            if [[ $? -ne 0 ]] || [[ -z "$DISCOVERED_SYMBOLS" ]]; then
-                log_error "Failed to discover symbols. Falling back to manual input."
+                
+                if [[ $? -ne 0 ]] || [[ -z "$DISCOVERED_SYMBOLS" ]]; then
+                    log_error "Failed to discover symbols. Falling back to manual input."
+                    SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
+                    SYMBOLS_TO_TRAIN=("$SYMBOL")
+                else
+                    # Parse JSON array of symbols
+                    DISCOVERED_ARRAY=($(echo "$DISCOVERED_SYMBOLS" | python3 -c "import sys, json; symbols = json.load(sys.stdin); print(' '.join(symbols))"))
+                    log_info "Discovered ${#DISCOVERED_ARRAY[@]} symbols: ${DISCOVERED_ARRAY[*]}"
+                    SYMBOL=$(prompt_input "Enter symbol to train (e.g., BTCUSDT)" "${DISCOVERED_ARRAY[0]}")
+                    SYMBOLS_TO_TRAIN=("$SYMBOL")
+                fi
+                
+                deactivate 2>/dev/null || true
+            else
+                log_error "Virtual environment not found, cannot discover symbols"
                 SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
                 SYMBOLS_TO_TRAIN=("$SYMBOL")
-            else
-                # Parse JSON array of symbols
-                SYMBOLS_TO_TRAIN=($(echo "$DISCOVERED_SYMBOLS" | python3 -c "import sys, json; symbols = json.load(sys.stdin); print(' '.join(symbols))"))
-                log_info "Discovered ${#SYMBOLS_TO_TRAIN[@]} symbols: ${SYMBOLS_TO_TRAIN[*]}"
-                
-                if prompt_yes_no "Train models for all discovered symbols?" "Y"; then
-                    log_info "Will train models for: ${SYMBOLS_TO_TRAIN[*]}"
-                else
-                    # Let user select which symbols to train
-                    log_info "Select symbols to train (comma-separated, e.g., BTCUSDT,ETHUSDT):"
-                    SELECTED=$(prompt_input "Symbols" "${SYMBOLS_TO_TRAIN[0]}")
-                    IFS=',' read -ra SYMBOLS_TO_TRAIN <<< "$SELECTED"
-                    # Trim whitespace
-                    for i in "${!SYMBOLS_TO_TRAIN[@]}"; do
-                        SYMBOLS_TO_TRAIN[$i]=$(echo "${SYMBOLS_TO_TRAIN[$i]}" | xargs)
-                    done
-                fi
             fi
-            
-            deactivate 2>/dev/null || true
         else
-            log_error "Virtual environment not found, cannot discover symbols"
+            # Fixed mode - prompt for symbol
             SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
             SYMBOLS_TO_TRAIN=("$SYMBOL")
         fi
-    else
-        # Fixed mode - prompt for symbol
-        SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
-        SYMBOLS_TO_TRAIN=("$SYMBOL")
     fi
     
-    # Train models for each symbol
-    log_info "Running model training..."
+    # Train model based on training mode
+    log_info "Running model training (mode: $MODEL_TRAINING_MODE)..."
     if [[ -d "$VENV_PATH" ]]; then
         source "$VENV_PATH/bin/activate"
         cd "$SCRIPT_DIR"
         load_env_file "$SCRIPT_DIR/.env"
         export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
         
-        for SYMBOL in "${SYMBOLS_TO_TRAIN[@]}"; do
-            if [[ -n "$SYMBOL" ]]; then
-                log_info "Training model for $SYMBOL..."
-                python3 train_model.py --symbol "$SYMBOL" || log_warn "Model training for $SYMBOL completed with warnings (check logs)"
+        if [[ "$MODEL_TRAINING_MODE" == "multi_symbol" ]]; then
+            # Multi-symbol training - train_model.py reads config
+            if [[ -n "$MULTI_SYMBOL_SYMBOLS" ]]; then
+                log_info "Training multi-symbol model on: $MULTI_SYMBOL_SYMBOLS"
+            else
+                log_info "Training multi-symbol model using auto universe discovery..."
             fi
-        done
+            python3 train_model.py --days 730 || log_warn "Model training completed with warnings (check logs)"
+        else
+            # Single-symbol training
+            for SYMBOL in "${SYMBOLS_TO_TRAIN[@]}"; do
+                if [[ -n "$SYMBOL" ]]; then
+                    log_info "Training single-symbol model for $SYMBOL..."
+                    python3 train_model.py --symbol "$SYMBOL" --days 730 || log_warn "Model training for $SYMBOL completed with warnings (check logs)"
+                fi
+            done
+        fi
         
         deactivate 2>/dev/null || true
     else
@@ -1015,32 +1149,71 @@ echo "=========================================="
 log_success "Installation Complete!"
 echo "=========================================="
 echo ""
+
+# Prompt to start bot now
+log_info ""
+if prompt_yes_no "Do you want to start the bot now on TESTNET with the conservative profile?" "N"; then
+    log_info "Starting bot..."
+    
+    if [[ -d "$VENV_PATH" ]]; then
+        source "$VENV_PATH/bin/activate"
+        cd "$SCRIPT_DIR"
+        load_env_file "$SCRIPT_DIR/.env"
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        
+        log_info "Starting live_bot.py in foreground (press Ctrl+C to stop)..."
+        log_warn "This will run in the current terminal. For background operation, use systemd or screen/tmux."
+        echo ""
+        
+        # Run bot (will run until interrupted)
+        python3 live_bot.py || log_warn "Bot exited with warnings (check logs)"
+        
+        deactivate 2>/dev/null || true
+    else
+        log_error "Virtual environment not found, cannot start bot"
+    fi
+else
+    log_info "Bot not started. Use the instructions below to start it manually."
+fi
+
+echo ""
 log_info "Next Steps:"
 echo ""
 echo "1. Activate the virtual environment:"
 echo "   source venv/bin/activate"
 echo ""
-echo "2. Fetch historical data (if not done already):"
-echo "   python scripts/fetch_and_check_data.py --symbol BTCUSDT --years 2"
+echo "2. Check model coverage (if using universe mode):"
+echo "   python scripts/check_model_coverage.py"
 echo ""
-echo "3. Train an initial model:"
-echo "   python train_model.py --symbol BTCUSDT"
+echo "3. Start the bot manually:"
 echo ""
-echo "4. Run a testnet campaign (HIGHLY RECOMMENDED):"
-echo "   python scripts/run_testnet_campaign.py --profile $DEFAULT_PROFILE --duration-days 14"
+echo "   Option A - Direct run (foreground):"
+echo "   source venv/bin/activate"
+echo "   python live_bot.py"
 echo ""
-echo "5. Monitor status:"
+echo "   Option B - Using systemd (background, if configured):"
+echo "   sudo systemctl start bybit-bot-live.service"
+echo "   sudo systemctl enable bybit-bot-live.service  # Enable on boot"
+echo "   sudo journalctl -u bybit-bot-live.service -f   # Monitor logs"
+echo ""
+echo "   Option C - Using screen/tmux (background):"
+echo "   screen -S trading_bot"
+echo "   source venv/bin/activate"
+echo "   python live_bot.py"
+echo "   # Press Ctrl+A then D to detach"
+echo ""
+echo "4. Monitor status:"
 echo "   python scripts/show_status.py"
 echo ""
-echo "6. Test universe discovery (if using auto mode):"
-echo "   python scripts/test_universe.py"
+echo "5. Check model coverage:"
+echo "   python scripts/check_model_coverage.py"
 echo ""
-echo "7. Review documentation:"
+echo "6. Review documentation:"
 echo "   - docs/FIRST_DEPLOYMENT_BUNDLE.md"
 echo "   - docs/TESTNET_CAMPAIGN_GUIDE.md"
 echo "   - docs/OPERATIONS_RUNBOOK.md"
+echo "   - docs/NEW_SYMBOL_ONBOARDING.md"
 echo "   - docs/UNIVERSE_MANAGEMENT.md (if using auto mode)"
-echo "   - docs/UNIVERSE_VALIDATION_REPORT.md"
 echo ""
 log_warn "IMPORTANT REMINDERS:"
 echo "  - Always start on testnet first!"
