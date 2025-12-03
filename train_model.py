@@ -17,11 +17,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.config.config_loader import load_config
 from src.data.historical_data import HistoricalDataCollector
 from src.models.train import ModelTrainer
+from src.exchange.universe import UniverseManager
 
 
 def main():
     parser = argparse.ArgumentParser(description='Train meta-model for trading bot')
-    parser.add_argument('--symbol', type=str, default='BTCUSDT', help='Trading symbol')
+    parser.add_argument('--symbol', type=str, default=None, help='Trading symbol (if not provided, uses universe or config)')
     parser.add_argument('--days', type=int, default=730, help='Number of days of history')
     parser.add_argument('--version', type=str, default='1.0', help='Model version')
     parser.add_argument('--config', type=str, default='config/config.yaml', help='Config file path')
@@ -39,6 +40,28 @@ def main():
     config = load_config(args.config)
     logger.info(f"Loaded configuration from {args.config}")
     
+    # Determine symbol(s) to train
+    if args.symbol:
+        # Explicit symbol provided via CLI
+        symbols = [args.symbol]
+        logger.info(f"Training for explicit symbol: {symbols[0]}")
+    else:
+        # Use universe manager or fallback to config
+        universe_manager = UniverseManager(config)
+        symbols = universe_manager.get_symbols()
+        if not symbols:
+            # Fallback to config symbols
+            symbols = config.get('trading', {}).get('symbols', ['BTCUSDT'])
+        logger.info(f"Training for {len(symbols)} symbol(s) from universe/config: {symbols}")
+    
+    # Train model for each symbol (or first symbol if multiple)
+    if len(symbols) > 1:
+        logger.warning(f"Multiple symbols provided ({len(symbols)}), training only for first: {symbols[0]}")
+        logger.info("For multi-symbol training, run train_model.py separately for each symbol")
+        symbols = [symbols[0]]
+    
+    symbol = symbols[0]
+    
     # Initialize data collector
     data_collector = HistoricalDataCollector(
         api_key=config['exchange'].get('api_key'),
@@ -47,9 +70,9 @@ def main():
     )
     
     # Download historical data
-    logger.info(f"Downloading {args.days} days of historical data for {args.symbol}")
+    logger.info(f"Downloading {args.days} days of historical data for {symbol}")
     df = data_collector.download_and_save(
-        symbol=args.symbol,
+        symbol=symbol,
         days=args.days,
         interval="60",  # 1 hour
         data_path=config['data']['historical_data_path']
@@ -72,7 +95,7 @@ def main():
     
     features_df, labels = trainer.prepare_data(
         df=df,
-        symbol=args.symbol,
+        symbol=symbol,
         hold_periods=4,  # Fallback for time barrier
         profit_threshold=0.005,  # Fallback threshold
         fee_rate=0.0005,  # 0.05% per trade

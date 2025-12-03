@@ -4,6 +4,22 @@ exchange:
   testnet: true  # Use testnet for initial testing
   api_key: "${BYBIT_API_KEY}"  # From environment
   api_secret: "${BYBIT_API_SECRET}"  # From environment
+  
+  # Universe Discovery & Filtering
+  universe_mode: "fixed"  # "auto" for dynamic discovery, "fixed" for explicit list (DEFAULT: fixed for safety)
+  fixed_symbols: []  # Used when universe_mode="fixed" (empty = use trading.symbols)
+  
+  # Universe filters (used when universe_mode="auto")
+  min_usd_volume_24h: 50000000  # Minimum $50M 24h volume (USD turnover)
+  min_price: 0.05  # Minimum price per unit
+  max_symbols: 30  # Maximum symbols to include after filtering
+  
+  # Whitelist/Blacklist (applied in both modes)
+  include_symbols: []  # Always include these symbols (even if below thresholds)
+  exclude_symbols: []  # Always exclude these symbols
+  
+  # Universe caching
+  universe_refresh_minutes: 60  # Refresh universe cache every 60 minutes
 
 # Trading Settings
 trading:

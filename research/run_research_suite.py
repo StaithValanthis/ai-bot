@@ -36,6 +36,7 @@ from src.signals.primary_signal import PrimarySignalGenerator
 from src.signals.regime_filter import RegimeFilter
 from src.portfolio.selector import PortfolioSelector
 from src.signals.meta_predictor import MetaPredictor
+from src.exchange.universe import UniverseManager
 
 
 class ResearchHarness:
@@ -428,7 +429,11 @@ class ResearchHarness:
         self,
         symbols: List[str],
         years: int = 2,
-        risk_levels: List[str] = ["conservative", "moderate", "aggressive"]
+        risk_levels: List[str] = ["conservative", "moderate", "aggressive"],
+        ensemble_options: List[bool] = [True, False],
+        portfolio_options: List[bool] = [False, True],
+        regime_sensitivity: List[str] = ["strict", "moderate", "lenient"],
+        output_dir: str = "research_results"
     ) -> pd.DataFrame:
         """
         Run full research suite.
@@ -454,7 +459,7 @@ class ResearchHarness:
             ensemble_options=ensemble_options,
             portfolio_options=portfolio_options,
             regime_sensitivity=regime_sensitivity,
-            barrier_params=barrier_params
+            barrier_params=None  # Use defaults
         )
         
         # Initialize data collector
@@ -645,7 +650,7 @@ class ResearchHarness:
 
 def main():
     parser = argparse.ArgumentParser(description='Run research suite')
-    parser.add_argument('--symbols', nargs='+', default=['BTCUSDT', 'ETHUSDT'], help='Symbols to test')
+    parser.add_argument('--symbols', nargs='+', default=None, help='Symbols to test (if not provided, uses universe or config)')
     parser.add_argument('--years', type=int, default=2, help='Years of history')
     parser.add_argument('--risk-levels', nargs='+', default=['conservative', 'moderate'], help='Risk levels')
     parser.add_argument('--ensemble', nargs='+', type=str, default=['true', 'false'], help='Ensemble on/off (true/false)')
@@ -677,6 +682,26 @@ def main():
     # Load config
     config = load_config(args.config)
     
+    # Determine symbols to test
+    if args.symbols:
+        symbols = args.symbols
+        logger.info(f"Using explicit symbols: {symbols}")
+    else:
+        # Use universe manager or fallback to config
+        universe_manager = UniverseManager(config)
+        symbols = universe_manager.get_symbols()
+        if not symbols:
+            # Fallback to config symbols
+            symbols = config.get('trading', {}).get('symbols', ['BTCUSDT', 'ETHUSDT'])
+        
+        # Limit to top N for research (to keep runs reasonable)
+        max_research_symbols = config.get('exchange', {}).get('max_symbols', 30)
+        if len(symbols) > max_research_symbols:
+            logger.info(f"Limiting research to top {max_research_symbols} symbols by liquidity")
+            symbols = symbols[:max_research_symbols]
+        
+        logger.info(f"Using {len(symbols)} symbols from universe/config: {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
+    
     # Initialize harness
     harness = ResearchHarness(config)
     
@@ -686,7 +711,7 @@ def main():
     
     # Run research suite
     results_df = harness.run_research_suite(
-        symbols=args.symbols,
+        symbols=symbols,
         years=args.years,
         risk_levels=args.risk_levels,
         ensemble_options=ensemble_options,

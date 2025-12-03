@@ -6,8 +6,9 @@
 # - Installs system dependencies
 # - Creates Python virtual environment
 # - Installs Python packages
-# - Prompts for configuration (API keys, profile, etc.)
+# - Prompts for configuration (API keys, profile, universe mode, etc.)
 # - Writes .env file
+# - Updates config.yaml with universe settings
 # - Optionally sets up systemd services
 #
 # Usage: bash install.sh
@@ -265,6 +266,41 @@ case "$PROFILE_CHOICE" in
         ;;
 esac
 
+# Universe mode selection
+log_info ""
+log_info "Universe Discovery Mode:"
+echo "  [1] fixed (Recommended for first deployment - uses explicit symbol list)"
+echo "  [2] auto (Dynamic discovery from Bybit - requires API access)"
+echo ""
+UNIVERSE_CHOICE=$(prompt_input "Enter universe mode [1-2]" "1")
+
+case "$UNIVERSE_CHOICE" in
+    1)
+        UNIVERSE_MODE="fixed"
+        log_info "Selected: Fixed mode (will use symbols from config.yaml)"
+        ;;
+    2)
+        UNIVERSE_MODE="auto"
+        log_info "Selected: Auto mode (will discover symbols dynamically)"
+        log_warn "Auto mode requires API access and makes additional API calls"
+        ;;
+    *)
+        UNIVERSE_MODE="fixed"
+        log_warn "Invalid choice, defaulting to fixed mode"
+        ;;
+esac
+
+# Universe settings (if auto mode)
+UNIVERSE_MIN_VOLUME=""
+UNIVERSE_MAX_SYMBOLS=""
+if [[ "$UNIVERSE_MODE" == "auto" ]]; then
+    log_info ""
+    log_info "Universe Filtering Settings (for auto mode):"
+    UNIVERSE_MIN_VOLUME=$(prompt_input "Minimum 24h USD volume (e.g., 50000000 for $50M)" "50000000")
+    UNIVERSE_MAX_SYMBOLS=$(prompt_input "Maximum symbols to include (e.g., 10 for testing, 30 for production)" "10")
+    log_info "Universe will filter symbols with >= \$$((UNIVERSE_MIN_VOLUME / 1000000))M volume, max $UNIVERSE_MAX_SYMBOLS symbols"
+fi
+
 # Discord webhook
 log_info ""
 DISCORD_WEBHOOK=$(prompt_input "Enter Discord webhook URL for alerts (leave blank to skip)" "")
@@ -386,6 +422,76 @@ EOF
     # Set restrictive permissions
     chmod 600 "$ENV_FILE" 2>/dev/null || log_warn "Could not set .env permissions (may need manual chmod 600)"
     log_success ".env file written to $ENV_FILE"
+fi
+
+# Update config.yaml with universe settings
+CONFIG_FILE="$SCRIPT_DIR/config/config.yaml"
+if [[ -f "$CONFIG_FILE" ]]; then
+    log_info "Updating config.yaml with universe settings..."
+    
+    # Backup config.yaml
+    CONFIG_BACKUP="${CONFIG_FILE}.backup_$(date +%Y%m%d_%H%M%S)"
+    cp "$CONFIG_FILE" "$CONFIG_BACKUP"
+    log_info "Config backup created: $CONFIG_BACKUP"
+    
+    # Use Python to update YAML (more reliable than sed for YAML)
+    if [[ -d "$VENV_PATH" ]]; then
+        source "$VENV_PATH/bin/activate"
+        cd "$SCRIPT_DIR"
+        export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+        
+        python3 <<PYTHON_SCRIPT
+import yaml
+import sys
+
+config_path = "$CONFIG_FILE"
+universe_mode = "$UNIVERSE_MODE"
+min_volume = "$UNIVERSE_MIN_VOLUME"
+max_symbols = "$UNIVERSE_MAX_SYMBOLS"
+
+try:
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Ensure exchange section exists
+    if 'exchange' not in config:
+        config['exchange'] = {}
+    
+    # Update universe settings
+    config['exchange']['universe_mode'] = universe_mode
+    
+    if universe_mode == 'auto':
+        if min_volume:
+            config['exchange']['min_usd_volume_24h'] = int(min_volume)
+        if max_symbols:
+            config['exchange']['max_symbols'] = int(max_symbols)
+    
+    # Write back
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    
+    print(f"Updated config.yaml: universe_mode={universe_mode}")
+    if universe_mode == 'auto':
+        print(f"  min_usd_volume_24h={min_volume}")
+        print(f"  max_symbols={max_symbols}")
+except Exception as e:
+    print(f"Warning: Could not update config.yaml: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+        
+        if [[ $? -eq 0 ]]; then
+            log_success "config.yaml updated with universe settings"
+        else
+            log_warn "Could not update config.yaml (you may need to set universe_mode manually)"
+        fi
+        
+        deactivate 2>/dev/null || true
+    else
+        log_warn "Virtual environment not found, cannot update config.yaml automatically"
+        log_info "Please manually set universe_mode=$UNIVERSE_MODE in config/config.yaml"
+    fi
+else
+    log_warn "config.yaml not found, skipping universe settings update"
 fi
 
 # (E) Optional systemd/cron integration
@@ -517,15 +623,62 @@ log_info "Step 6: Optional initial setup steps"
 
 if prompt_yes_no "Do you want to fetch historical data now?" "N"; then
     log_info "Fetching historical data..."
-    SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
-    YEARS=$(prompt_input "Enter years of history" "2")
     
-    log_info "Running data fetch..."
-    source "$VENV_PATH/bin/activate"
-    python scripts/fetch_and_check_data.py \
-        --symbol "$SYMBOL" \
-        --years "$YEARS" \
-        --timeframe 60 || log_warn "Data fetch completed with warnings (check logs)"
+    # If auto universe mode, let user choose symbols or use discovered ones
+    if [[ "$UNIVERSE_MODE" == "auto" ]]; then
+        log_info "Auto universe mode detected. You can:"
+        echo "  [1] Fetch data for specific symbol(s)"
+        echo "  [2] Test universe discovery first (recommended)"
+        echo ""
+        FETCH_CHOICE=$(prompt_input "Choose option [1-2]" "2")
+        
+        if [[ "$FETCH_CHOICE" == "2" ]]; then
+            log_info "Testing universe discovery..."
+            if [[ -d "$VENV_PATH" ]]; then
+                source "$VENV_PATH/bin/activate"
+                cd "$SCRIPT_DIR"
+                export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+                python scripts/test_universe.py || log_warn "Universe test completed with warnings"
+                deactivate 2>/dev/null || true
+            fi
+            log_info "You can fetch data later for specific symbols"
+        else
+            SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
+            YEARS=$(prompt_input "Enter years of history" "2")
+            
+            log_info "Running data fetch..."
+            if [[ -d "$VENV_PATH" ]]; then
+                source "$VENV_PATH/bin/activate"
+                cd "$SCRIPT_DIR"
+                export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+                python scripts/fetch_and_check_data.py \
+                    --symbol "$SYMBOL" \
+                    --years "$YEARS" \
+                    --timeframe 60 || log_warn "Data fetch completed with warnings (check logs)"
+                deactivate 2>/dev/null || true
+            else
+                log_error "Virtual environment not found, cannot fetch data"
+            fi
+        fi
+    else
+        # Fixed mode - prompt for symbol
+        SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
+        YEARS=$(prompt_input "Enter years of history" "2")
+        
+        log_info "Running data fetch..."
+        if [[ -d "$VENV_PATH" ]]; then
+            source "$VENV_PATH/bin/activate"
+            cd "$SCRIPT_DIR"
+            export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+            python scripts/fetch_and_check_data.py \
+                --symbol "$SYMBOL" \
+                --years "$YEARS" \
+                --timeframe 60 || log_warn "Data fetch completed with warnings (check logs)"
+            deactivate 2>/dev/null || true
+        else
+            log_error "Virtual environment not found, cannot fetch data"
+        fi
+    fi
 fi
 
 if prompt_yes_no "Do you want to train an initial model now?" "N"; then
@@ -533,8 +686,16 @@ if prompt_yes_no "Do you want to train an initial model now?" "N"; then
     SYMBOL=$(prompt_input "Enter symbol (e.g., BTCUSDT)" "BTCUSDT")
     
     log_info "Running model training..."
-    source "$VENV_PATH/bin/activate"
-    python train_model.py --symbol "$SYMBOL" || log_warn "Model training completed with warnings (check logs)"
+    if [[ -d "$VENV_PATH" ]]; then
+        source "$VENV_PATH/bin/activate"
+        # Ensure we're in the repo root and PYTHONPATH is set
+        cd "$SCRIPT_DIR"
+        export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+        python train_model.py --symbol "$SYMBOL" || log_warn "Model training completed with warnings (check logs)"
+        deactivate 2>/dev/null || true
+    else
+        log_error "Virtual environment not found, cannot train model"
+    fi
 fi
 
 # Self-test section
@@ -560,17 +721,37 @@ else
     log_warn ".env file not found (may have been skipped)"
 fi
 
-# Check requirements
-if python3 -c "import pandas, numpy, xgboost, pybit" 2>/dev/null; then
-    log_success "Core Python packages installed"
+# Check requirements (activate venv first)
+if [[ -d "$VENV_PATH" ]]; then
+    source "$VENV_PATH/bin/activate"
+    cd "$SCRIPT_DIR"
+    export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+    if python -c "import pandas, numpy, xgboost, pybit, yaml" 2>/dev/null; then
+        log_success "Core Python packages installed"
+    else
+        log_warn "Some Python packages may be missing (check manually)"
+    fi
+    
+    # Test universe module if auto mode
+    if [[ "$UNIVERSE_MODE" == "auto" ]]; then
+        if python -c "from src.exchange.universe import UniverseManager" 2>/dev/null; then
+            log_success "Universe module importable"
+        else
+            log_warn "Universe module may have issues (check manually)"
+        fi
+    fi
+    
+    deactivate 2>/dev/null || true
 else
-    log_warn "Some Python packages may be missing (check manually)"
+    log_warn "Cannot check packages (venv not found)"
 fi
 
 # Syntax check on key files
 log_info "Running syntax checks..."
 if [[ -d "$VENV_PATH" ]]; then
     source "$VENV_PATH/bin/activate"
+    cd "$SCRIPT_DIR"
+    export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
     if python -m py_compile src/config/config_loader.py live_bot.py train_model.py 2>/dev/null; then
         log_success "Python syntax check passed"
     else
@@ -604,10 +785,15 @@ echo ""
 echo "5. Monitor status:"
 echo "   python scripts/show_status.py"
 echo ""
-echo "6. Review documentation:"
+echo "6. Test universe discovery (if using auto mode):"
+echo "   python scripts/test_universe.py"
+echo ""
+echo "7. Review documentation:"
 echo "   - docs/FIRST_DEPLOYMENT_BUNDLE.md"
 echo "   - docs/TESTNET_CAMPAIGN_GUIDE.md"
 echo "   - docs/OPERATIONS_RUNBOOK.md"
+echo "   - docs/UNIVERSE_MANAGEMENT.md (if using auto mode)"
+echo "   - docs/UNIVERSE_VALIDATION_REPORT.md"
 echo ""
 log_warn "IMPORTANT REMINDERS:"
 echo "  - Always start on testnet first!"
@@ -619,6 +805,12 @@ echo ""
 log_info "Configuration files:"
 echo "  - .env: $SCRIPT_DIR/.env"
 echo "  - config.yaml: $SCRIPT_DIR/config/config.yaml"
+if [[ "$UNIVERSE_MODE" == "auto" ]]; then
+    echo "  - Universe mode: auto (discovering symbols dynamically)"
+    echo "  - Universe cache: $SCRIPT_DIR/data/universe_cache.json"
+else
+    echo "  - Universe mode: fixed (using symbols from config.yaml)"
+fi
 echo ""
 if [[ -d "$SYSTEMD_DIR" ]]; then
     log_info "Systemd services:"

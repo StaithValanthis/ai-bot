@@ -33,6 +33,7 @@ from src.monitoring.trade_logger import TradeLogger
 from src.monitoring.health import HealthMonitor
 from src.monitoring.alerts import AlertManager
 from src.portfolio.selector import PortfolioSelector
+from src.exchange.universe import UniverseManager
 
 
 class TradingBot:
@@ -42,6 +43,13 @@ class TradingBot:
         """Initialize trading bot"""
         self.config = load_config(config_path)
         self.running = False
+        
+        # Initialize universe manager
+        self.universe_manager = UniverseManager(self.config)
+        
+        # Get trading symbols from universe (or fallback to config)
+        self.trading_symbols = self.universe_manager.get_symbols()
+        logger.info(f"Trading symbols: {self.trading_symbols}")
         
         # Initialize components
         self.feature_calc = FeatureCalculator(self.config)
@@ -70,10 +78,11 @@ class TradingBot:
             testnet=exchange_config.get('testnet', True)
         )
         
-        # Set leverage
-        for symbol in self.config['trading']['symbols']:
-            leverage = int(self.config['risk']['max_leverage'])
+        # Set leverage for all trading symbols
+        leverage = int(self.config['risk']['max_leverage'])
+        for symbol in self.trading_symbols:
             self.bybit_client.set_leverage(symbol, leverage)
+            logger.debug(f"Set leverage {leverage}x for {symbol}")
         
         # Data storage
         self.candle_data = {}  # Store candles per symbol
@@ -188,7 +197,7 @@ class TradingBot:
                     logger.info("Portfolio rebalancing triggered")
                     # Rebalance: select symbols based on current data
                     symbol_data = {}
-                    for sym in self.config['trading']['symbols']:
+                    for sym in self.trading_symbols:
                         if sym in self.candle_data and len(self.candle_data[sym]) >= 50:
                             df_with_features_sym = self.feature_calc.calculate_indicators(self.candle_data[sym])
                             symbol_data[sym] = df_with_features_sym
@@ -468,8 +477,14 @@ class TradingBot:
         logger.info("Starting trading bot")
         logger.info("=" * 60)
         
+        # Refresh universe if in auto mode (to get latest symbols)
+        if self.config['exchange'].get('universe_mode') == 'auto':
+            logger.info("Auto universe mode: refreshing symbol list...")
+            self.trading_symbols = self.universe_manager.get_symbols(force_refresh=True)
+            logger.info(f"Universe refreshed: {len(self.trading_symbols)} symbols")
+        
         # Initialize data streams
-        symbols = self.config['trading']['symbols']
+        symbols = self.trading_symbols
         
         def on_candle(df):
             self._on_new_candle(df)
@@ -485,7 +500,7 @@ class TradingBot:
         stream.start()
         self.running = True
         
-        logger.info(f"Bot running. Monitoring {symbols}")
+        logger.info(f"Bot running. Monitoring {len(symbols)} symbols: {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
         logger.info("Press Ctrl+C to stop")
         
         # Initialize portfolio selector (if enabled)

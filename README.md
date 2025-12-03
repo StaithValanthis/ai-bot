@@ -38,6 +38,7 @@ This trading bot implements a **meta-labeling strategy** (inspired by Lopez de P
 - ✅ **Volatility-Targeted Sizing**: Adjusts position size by market volatility
 - ✅ **Walk-Forward Validation**: Proper time-series validation (no look-ahead bias)
 - ✅ **Slippage & Funding Modeling**: Realistic cost modeling in backtests
+- ✅ **Universe Discovery**: Dynamically discovers and filters tradable symbols from Bybit (auto or fixed mode)
 
 ### Infrastructure
 - ✅ Real-time data streaming via Bybit WebSocket
