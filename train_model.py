@@ -8,11 +8,54 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from loguru import logger
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add src to path - ensure absolute path regardless of CWD
+# Get absolute path of script directory
+_script_file = os.path.abspath(__file__)
+_script_dir = os.path.dirname(_script_file)
+
+# Verify src module exists before adding to path
+_src_path = os.path.join(_script_dir, "src")
+_src_init = os.path.join(_src_path, "__init__.py")
+
+if not os.path.isdir(_src_path) or not os.path.isfile(_src_init):
+    # Fallback: try current working directory
+    _cwd = os.getcwd()
+    _cwd_src = os.path.join(_cwd, "src")
+    _cwd_src_init = os.path.join(_cwd_src, "__init__.py")
+    
+    if os.path.isdir(_cwd_src) and os.path.isfile(_cwd_src_init):
+        if _cwd not in sys.path:
+            sys.path.insert(0, _cwd)
+        _script_dir = _cwd  # Use CWD as script dir
+        _src_path = _cwd_src
+    else:
+        print(f"ERROR: Could not find src module.", file=sys.stderr)
+        print(f"  Script directory: {_script_dir}", file=sys.stderr)
+        print(f"  Expected src at: {_src_path}", file=sys.stderr)
+        print(f"  Current working directory: {_cwd}", file=sys.stderr)
+        print(f"  Expected src at CWD: {_cwd_src}", file=sys.stderr)
+        print(f"  sys.path: {sys.path[:3]}", file=sys.stderr)
+        sys.exit(1)
+
+# Add script directory to path if not already there
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+# Verify we can import src
+try:
+    import src
+    if not hasattr(src, '__path__'):
+        raise ImportError("src is not a package")
+except ImportError as e:
+    print(f"ERROR: Cannot import src module. Path setup may have failed.", file=sys.stderr)
+    print(f"  Script dir: {_script_dir}", file=sys.stderr)
+    print(f"  sys.path[0]: {sys.path[0] if sys.path else 'empty'}", file=sys.stderr)
+    print(f"  Error: {e}", file=sys.stderr)
+    sys.exit(1)
 
 from src.config.config_loader import load_config
 from src.data.historical_data import HistoricalDataCollector

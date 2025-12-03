@@ -83,6 +83,39 @@ prompt_secret() {
     echo "$response"
 }
 
+# Load .env file and export variables
+load_env_file() {
+    local env_file="$1"
+    if [[ -f "$env_file" ]]; then
+        # Read .env file and export variables (handles comments and empty lines)
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
+            
+            # Export variable if it's in KEY=VALUE format
+            if [[ "$line" =~ ^[[:space:]]*([^=]+)=(.*)$ ]]; then
+                local key="${BASH_REMATCH[1]// /}"
+                local value="${BASH_REMATCH[2]}"
+                # Remove quotes if present (handles both single and double quotes)
+                value="${value#\"}"
+                value="${value%\"}"
+                value="${value#\'}"
+                value="${value%\'}"
+                # Remove leading/trailing whitespace from key
+                key="${key#"${key%%[![:space:]]*}"}"
+                key="${key%"${key##*[![:space:]]}"}"
+                # Remove leading/trailing whitespace from value
+                value="${value#"${value%%[![:space:]]*}"}"
+                value="${value%"${value##*[![:space:]]}"}"
+                # Export the variable (using printf %q for safe handling, but simpler: just export)
+                # For most cases, direct export works fine
+                export "${key}"="${value}"
+            fi
+        done < "$env_file"
+    fi
+}
+
 # Trap for cleanup on interrupt
 cleanup() {
     log_warn "Installation interrupted. Partial changes may remain."
@@ -296,9 +329,16 @@ UNIVERSE_MAX_SYMBOLS=""
 if [[ "$UNIVERSE_MODE" == "auto" ]]; then
     log_info ""
     log_info "Universe Filtering Settings (for auto mode):"
-    UNIVERSE_MIN_VOLUME=$(prompt_input "Minimum 24h USD volume (e.g., 50000000 for $50M)" "50000000")
+    UNIVERSE_MIN_VOLUME=$(prompt_input "Minimum 24h USD volume (e.g., 50000000 for \$50M)" "50000000")
     UNIVERSE_MAX_SYMBOLS=$(prompt_input "Maximum symbols to include (e.g., 10 for testing, 30 for production)" "10")
-    log_info "Universe will filter symbols with >= \$$((UNIVERSE_MIN_VOLUME / 1000000))M volume, max $UNIVERSE_MAX_SYMBOLS symbols"
+    
+    # Calculate volume in millions for display (handle empty/unset safely)
+    if [[ -n "${UNIVERSE_MIN_VOLUME:-}" ]] && [[ "$UNIVERSE_MIN_VOLUME" =~ ^[0-9]+$ ]]; then
+        VOLUME_MILLIONS=$((UNIVERSE_MIN_VOLUME / 1000000))
+        log_info "Universe will filter symbols with >= \$${VOLUME_MILLIONS}M volume, max $UNIVERSE_MAX_SYMBOLS symbols"
+    else
+        log_info "Universe will filter symbols with >= \$${UNIVERSE_MIN_VOLUME:-50000000} volume, max $UNIVERSE_MAX_SYMBOLS symbols"
+    fi
 fi
 
 # Discord webhook
@@ -438,7 +478,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     if [[ -d "$VENV_PATH" ]]; then
         source "$VENV_PATH/bin/activate"
         cd "$SCRIPT_DIR"
-        export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
         
         python3 <<PYTHON_SCRIPT
 import yaml
@@ -637,8 +677,10 @@ if prompt_yes_no "Do you want to fetch historical data now?" "N"; then
             if [[ -d "$VENV_PATH" ]]; then
                 source "$VENV_PATH/bin/activate"
                 cd "$SCRIPT_DIR"
-                export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
-                python scripts/test_universe.py || log_warn "Universe test completed with warnings"
+                # Load .env file to export API keys for the test
+                load_env_file "$SCRIPT_DIR/.env"
+                export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+                python3 scripts/test_universe.py || log_warn "Universe test completed with warnings"
                 deactivate 2>/dev/null || true
             fi
             log_info "You can fetch data later for specific symbols"
@@ -650,8 +692,10 @@ if prompt_yes_no "Do you want to fetch historical data now?" "N"; then
             if [[ -d "$VENV_PATH" ]]; then
                 source "$VENV_PATH/bin/activate"
                 cd "$SCRIPT_DIR"
-                export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
-                python scripts/fetch_and_check_data.py \
+                # Load .env file to export API keys
+                load_env_file "$SCRIPT_DIR/.env"
+                export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+                python3 scripts/fetch_and_check_data.py \
                     --symbol "$SYMBOL" \
                     --years "$YEARS" \
                     --timeframe 60 || log_warn "Data fetch completed with warnings (check logs)"
@@ -669,8 +713,10 @@ if prompt_yes_no "Do you want to fetch historical data now?" "N"; then
         if [[ -d "$VENV_PATH" ]]; then
             source "$VENV_PATH/bin/activate"
             cd "$SCRIPT_DIR"
-            export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
-            python scripts/fetch_and_check_data.py \
+            # Load .env file to export API keys
+            load_env_file "$SCRIPT_DIR/.env"
+            export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+            python3 scripts/fetch_and_check_data.py \
                 --symbol "$SYMBOL" \
                 --years "$YEARS" \
                 --timeframe 60 || log_warn "Data fetch completed with warnings (check logs)"
@@ -690,8 +736,10 @@ if prompt_yes_no "Do you want to train an initial model now?" "N"; then
         source "$VENV_PATH/bin/activate"
         # Ensure we're in the repo root and PYTHONPATH is set
         cd "$SCRIPT_DIR"
-        export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
-        python train_model.py --symbol "$SYMBOL" || log_warn "Model training completed with warnings (check logs)"
+        # Load .env file to export API keys
+        load_env_file "$SCRIPT_DIR/.env"
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        python3 train_model.py --symbol "$SYMBOL" || log_warn "Model training completed with warnings (check logs)"
         deactivate 2>/dev/null || true
     else
         log_error "Virtual environment not found, cannot train model"
@@ -725,7 +773,7 @@ fi
 if [[ -d "$VENV_PATH" ]]; then
     source "$VENV_PATH/bin/activate"
     cd "$SCRIPT_DIR"
-    export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+    export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     if python -c "import pandas, numpy, xgboost, pybit, yaml" 2>/dev/null; then
         log_success "Core Python packages installed"
     else
@@ -751,7 +799,7 @@ log_info "Running syntax checks..."
 if [[ -d "$VENV_PATH" ]]; then
     source "$VENV_PATH/bin/activate"
     cd "$SCRIPT_DIR"
-    export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+    export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
     if python -m py_compile src/config/config_loader.py live_bot.py train_model.py 2>/dev/null; then
         log_success "Python syntax check passed"
     else

@@ -48,12 +48,26 @@ def test_auto_mode():
     config = load_config()
     
     # Check if API keys are available
-    api_key = config.get('exchange', {}).get('api_key')
-    api_secret = config.get('exchange', {}).get('api_secret')
+    api_key = config.get('exchange', {}).get('api_key', '')
+    api_secret = config.get('exchange', {}).get('api_secret', '')
+    
+    # Strip whitespace
+    api_key = api_key.strip() if api_key else ''
+    api_secret = api_secret.strip() if api_secret else ''
+    
+    # Debug: Check environment variables directly
+    import os
+    env_api_key = os.getenv('BYBIT_API_KEY', '').strip()
+    env_api_secret = os.getenv('BYBIT_API_SECRET', '').strip()
     
     if not api_key or not api_secret:
-        logger.warning("⚠️  API keys not found. Skipping auto mode test.")
+        logger.warning("⚠️  API keys not found in config. Skipping auto mode test.")
+        logger.info(f"   Config api_key: {'SET' if api_key else 'EMPTY'}")
+        logger.info(f"   Config api_secret: {'SET' if api_secret else 'EMPTY'}")
+        logger.info(f"   Env BYBIT_API_KEY: {'SET' if env_api_key else 'EMPTY'}")
+        logger.info(f"   Env BYBIT_API_SECRET: {'SET' if env_api_secret else 'EMPTY'}")
         logger.info("   Set BYBIT_API_KEY and BYBIT_API_SECRET in .env to test auto mode")
+        logger.info("   Make sure .env file is in the project root directory")
         return False
     
     # Force auto mode with conservative settings
