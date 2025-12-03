@@ -1,0 +1,259 @@
+# Exchange Settings
+exchange:
+  name: "bybit"
+  testnet: true  # Use testnet for initial testing
+  api_key: "${BYBIT_API_KEY}"  # From environment
+  api_secret: "${BYBIT_API_SECRET}"  # From environment
+
+# Trading Settings
+trading:
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+  timeframe: "1h"
+  base_timeframe: "1h"
+  confirmation_timeframe: "4h"
+
+# Data Settings
+data:
+  historical_data_path: "data/raw/bybit"  # Path for historical OHLCV data
+  data_quality_checks_enabled: true  # Enable quality checks on data load
+
+# Model Settings
+model:
+  version: "1.0"
+  path: "models/meta_model_v1.0.joblib"
+  scaler_path: "models/feature_scaler_v1.0.joblib"
+  config_path: "models/model_config_v1.0.json"
+  confidence_threshold: 0.6
+  use_ensemble: true  # Use ensemble (XGBoost + Logistic Regression baseline)
+  ensemble_xgb_weight: 0.7  # Weight for XGBoost in ensemble (0.7 = 70% XGBoost, 30% baseline)
+
+# Risk Management
+risk:
+  max_leverage: 3.0
+  max_position_size: 0.10  # 10% of equity per position
+  max_daily_loss: 0.05  # 5% of equity per day
+  max_drawdown: 0.15  # 15% from peak equity
+  max_open_positions: 3
+  base_position_size: 0.02  # 2% base size
+  stop_loss_pct: 0.02  # 2% stop loss
+  take_profit_pct: 0.03  # 3% take profit
+  trailing_stop_activation: 0.01  # Activate trailing stop after 1% profit
+  trailing_stop_distance: 0.01  # Trail stop 1% below peak
+
+# Feature Engineering
+features:
+  indicators:
+    - "rsi"
+    - "macd"
+    - "ema_9"
+    - "ema_21"
+    - "ema_50"
+    - "atr"
+    - "bollinger_bands"
+    - "adx"  # For regime classification
+  lookback_periods:
+    rsi: 14
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    ema_short: 9
+    ema_long: 21
+    ema_trend: 50
+    atr_period: 14
+    bb_period: 20
+    bb_std: 2
+
+# Data Settings
+data:
+  historical_data_path: "data/historical"
+  min_history_days: 730  # 2 years
+  update_frequency: 3600  # 1 hour in seconds
+
+# Logging
+logging:
+  level: "INFO"
+  trade_log_path: "logs/trades"
+  error_log_path: "logs/errors"
+  pnl_log_path: "logs/pnl"
+
+# Primary Signal Settings
+primary_signal:
+  ema_crossover: true
+  rsi_extremes: true
+  macd_crossover: true
+  rsi_oversold: 30
+  rsi_overbought: 70
+  signal_combination: "weighted"  # "voting" or "weighted"
+
+# Regime Filter (V2)
+regime_filter:
+  enabled: true
+  adx_threshold: 25
+  volatility_threshold: 2.0  # 2x average ATR
+  allow_ranging: false  # Don't trade trend-following in ranging markets
+  high_vol_multiplier: 0.5  # Reduce size in high volatility
+
+# Performance Guard (V2)
+performance_guard:
+  enabled: true
+  rolling_window_trades: 10
+  win_rate_threshold_reduced: 0.40
+  win_rate_threshold_paused: 0.30
+  drawdown_threshold_reduced: 0.05  # 5%
+  drawdown_threshold_paused: 0.10   # 10%
+  recovery_win_rate: 0.45
+  recovery_drawdown: 0.05
+
+# Triple-Barrier Labeling (V2)
+labeling:
+  use_triple_barrier: true
+  profit_barrier: 0.02  # 2%
+  loss_barrier: 0.01    # 1%
+  time_barrier_hours: 24
+
+# Volatility Targeting (V2)
+volatility_targeting:
+  enabled: true
+  target_volatility: 0.01  # 1% daily
+  lookback_period: 20  # days
+  max_multiplier: 2.0
+
+# Execution Costs (V2)
+execution:
+  base_slippage: 0.0001  # 0.01%
+  volatility_slippage_factor: true
+  include_funding: true
+  default_funding_rate: 0.0001  # 0.01% per 8 hours
+
+# Operations & Automation (V2.1)
+operations:
+  health_check_interval_seconds: 300  # 5 minutes
+  status_file_path: "logs/bot_status.json"
+  max_candle_gap_minutes: 15  # Alert if no candles for 15 minutes
+  max_api_errors: 5  # Alert if 5+ errors in window
+  api_error_window_minutes: 10
+  max_no_trade_hours: 168  # 7 days - warn if no trades
+  
+  model_rotation:
+    enabled: false  # Set to true to enable auto-retraining
+    retrain_frequency_days: 30  # Retrain monthly
+    min_sharpe_ratio: 1.0
+    min_profit_factor: 1.2
+    max_drawdown_threshold: 0.20
+    min_trades: 50
+    require_outperformance: true
+  
+  alerts:
+    enabled: false  # Set to true to enable alerts
+    discord_webhook_url: ""  # Optional Discord webhook
+    email_smtp_server: ""  # Optional SMTP server
+    email_recipients: []  # Optional email recipients
+    alert_on_pause: true
+    alert_on_kill_switch: true
+    alert_on_model_rotation: true
+    alert_on_health_issues: true
+
+# Portfolio & Cross-Sectional Selection (V2.1)
+portfolio:
+  cross_sectional:
+    enabled: false  # Set to true to enable cross-sectional selection
+    rebalance_interval_minutes: 1440  # 24 hours (daily rebalancing)
+    top_k: 3  # Select top 3 symbols
+    max_symbol_risk_pct: 0.10  # 10% max risk per symbol
+    min_liquidity: 1000000  # $1M minimum 24h volume
+    score_weights:
+      sharpe: 0.4  # Risk-adjusted return weight
+      adx: 0.3  # Trend strength weight
+      confidence: 0.2  # Model confidence weight
+      volatility: 0.1  # Volatility score weight (lower is better)
+
+# ============================================================================
+# RECOMMENDED PROFILES (Based on Backtesting - To Be Updated)
+# ============================================================================
+# These profiles will be refined based on research harness results.
+# For now, use conservative for initial deployment.
+
+# Profile: Conservative (Recommended for First Deployment)
+# Intended Use: Small account, first deployment, capital preservation priority
+# Representative Metrics (from backtests): [To be populated]
+# Biggest Risks: Low trade count in ranging markets, may miss opportunities
+profile_conservative:
+  risk:
+    max_leverage: 2.0
+    base_position_size: 0.01  # 1%
+    max_position_size: 0.05  # 5%
+    max_daily_loss: 0.03  # 3%
+    max_drawdown: 0.10  # 10%
+  model:
+    confidence_threshold: 0.65
+    use_ensemble: true
+    ensemble_xgb_weight: 0.7
+  regime_filter:
+    adx_threshold: 30  # Strict
+    allow_ranging: false
+  performance_guard:
+    win_rate_threshold_reduced: 0.35
+    win_rate_threshold_paused: 0.25
+    drawdown_threshold_reduced: 0.03
+    drawdown_threshold_paused: 0.08
+  portfolio:
+    cross_sectional:
+      enabled: false  # Start disabled
+
+# Profile: Moderate (After Validation)
+# Intended Use: After successful conservative deployment, moderate risk tolerance
+# Representative Metrics (from backtests): [To be populated]
+# Biggest Risks: Higher drawdowns, more exposure to market volatility
+profile_moderate:
+  risk:
+    max_leverage: 3.0
+    base_position_size: 0.02  # 2%
+    max_position_size: 0.10  # 10%
+    max_daily_loss: 0.05  # 5%
+    max_drawdown: 0.15  # 15%
+  model:
+    confidence_threshold: 0.60
+    use_ensemble: true
+    ensemble_xgb_weight: 0.7
+  regime_filter:
+    adx_threshold: 25  # Moderate
+    allow_ranging: false
+  performance_guard:
+    win_rate_threshold_reduced: 0.40
+    win_rate_threshold_paused: 0.30
+    drawdown_threshold_reduced: 0.05
+    drawdown_threshold_paused: 0.10
+  portfolio:
+    cross_sectional:
+      enabled: false  # Can enable after validation
+
+# Profile: Aggressive (EXPERIMENTAL - Use with Extreme Caution)
+# Intended Use: Only for experienced operators, high risk tolerance
+# Representative Metrics (from backtests): [To be populated]
+# Biggest Risks: High drawdowns, leverage risk, potential for large losses
+# WARNING: This profile is EXPERIMENTAL and not recommended for most users
+profile_aggressive:
+  risk:
+    max_leverage: 5.0
+    base_position_size: 0.03  # 3%
+    max_position_size: 0.15  # 15%
+    max_daily_loss: 0.07  # 7%
+    max_drawdown: 0.20  # 20%
+  model:
+    confidence_threshold: 0.55
+    use_ensemble: true
+    ensemble_xgb_weight: 0.7
+  regime_filter:
+    adx_threshold: 20  # Lenient
+    allow_ranging: true
+  performance_guard:
+    win_rate_threshold_reduced: 0.45
+    win_rate_threshold_paused: 0.35
+    drawdown_threshold_reduced: 0.07
+    drawdown_threshold_paused: 0.15
+  portfolio:
+    cross_sectional:
+      enabled: false  # Can enable after validation
+
