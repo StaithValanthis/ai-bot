@@ -401,6 +401,20 @@ if prompt_yes_no "Set up systemd services for live trading and scheduled retrain
     ABS_VENV="$ABS_SCRIPT_DIR/venv"
     ABS_ENV_FILE="$ABS_SCRIPT_DIR/.env"
     
+    # Get current user (fallback if $USER not set)
+    # Use parameter expansion with default, then verify
+    if [[ -n "${USER:-}" ]]; then
+        CURRENT_USER="$USER"
+    else
+        CURRENT_USER=$(whoami 2>/dev/null || echo "root")
+    fi
+    
+    # Ensure CURRENT_USER is set (handle edge cases)
+    if [[ -z "${CURRENT_USER:-}" ]]; then
+        CURRENT_USER="root"
+        log_warn "Could not determine current user, defaulting to 'root'"
+    fi
+    
     # Generate live bot service
     cat > "$SYSTEMD_DIR/bybit-bot-live.service" <<EOF
 [Unit]
