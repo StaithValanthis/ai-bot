@@ -786,10 +786,10 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
     
-    # Generate retrain service
-    cat > "$SYSTEMD_DIR/bybit-bot-retrain.service" <<EOF
+    # Generate training queue service (for new/untrained symbols)
+    cat > "$SYSTEMD_DIR/bybit-bot-train-queue.service" <<EOF
 [Unit]
-Description=Bybit AI Trading Bot (Scheduled Retraining)
+Description=Bybit AI Trading Bot (Process Training Queue - New Symbols)
 After=network.target
 
 [Service]
@@ -797,7 +797,7 @@ Type=oneshot
 User=$CURRENT_USER
 WorkingDirectory=$ABS_SCRIPT_DIR
 Environment="PATH=$ABS_VENV/bin"
-ExecStart=$ABS_VENV/bin/python $ABS_SCRIPT_DIR/scripts/scheduled_retrain.py
+ExecStart=$ABS_VENV/bin/python $ABS_SCRIPT_DIR/scripts/scheduled_retrain.py --skip-retrain
 StandardOutput=journal
 StandardError=journal
 
@@ -805,10 +805,44 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
     
-    # Generate retrain timer
+    # Generate training queue timer (hourly)
+    cat > "$SYSTEMD_DIR/bybit-bot-train-queue.timer" <<EOF
+[Unit]
+Description=Bybit AI Trading Bot Training Queue Timer (Hourly)
+Requires=bybit-bot-train-queue.service
+
+[Timer]
+# Run every hour at minute 0
+OnCalendar=*-*-* *:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    
+    # Generate retrain service (for model rotation - existing trained symbols)
+    cat > "$SYSTEMD_DIR/bybit-bot-retrain.service" <<EOF
+[Unit]
+Description=Bybit AI Trading Bot (Model Rotation - Retrain Existing Models)
+After=network.target
+
+[Service]
+Type=oneshot
+User=$CURRENT_USER
+WorkingDirectory=$ABS_SCRIPT_DIR
+Environment="PATH=$ABS_VENV/bin"
+ExecStart=$ABS_VENV/bin/python $ABS_SCRIPT_DIR/scripts/scheduled_retrain.py --skip-queue
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # Generate retrain timer (weekly)
     cat > "$SYSTEMD_DIR/bybit-bot-retrain.timer" <<EOF
 [Unit]
-Description=Bybit AI Trading Bot Retraining Timer
+Description=Bybit AI Trading Bot Retraining Timer (Weekly)
 Requires=bybit-bot-retrain.service
 
 [Timer]
@@ -828,6 +862,8 @@ EOF
     if command -v sudo &> /dev/null; then
         # Copy service files
         if sudo cp "$SYSTEMD_DIR/bybit-bot-live.service" /etc/systemd/system/ 2>/dev/null && \
+           sudo cp "$SYSTEMD_DIR/bybit-bot-train-queue.service" /etc/systemd/system/ 2>/dev/null && \
+           sudo cp "$SYSTEMD_DIR/bybit-bot-train-queue.timer" /etc/systemd/system/ 2>/dev/null && \
            sudo cp "$SYSTEMD_DIR/bybit-bot-retrain.service" /etc/systemd/system/ 2>/dev/null && \
            sudo cp "$SYSTEMD_DIR/bybit-bot-retrain.timer" /etc/systemd/system/ 2>/dev/null; then
             log_success "Service files copied to /etc/systemd/system/"
@@ -836,9 +872,16 @@ EOF
             if sudo systemctl daemon-reload 2>/dev/null; then
                 log_success "Systemd daemon reloaded"
                 
-                # Enable retrain timer (safe to enable, won't start until scheduled)
+                # Enable training queue timer (hourly - for new/untrained symbols)
+                if sudo systemctl enable bybit-bot-train-queue.timer 2>/dev/null; then
+                    log_success "Training queue timer enabled (will run hourly for new/untrained symbols)"
+                else
+                    log_warn "Could not enable training queue timer (may need manual setup)"
+                fi
+                
+                # Enable retrain timer (weekly - for model rotation)
                 if sudo systemctl enable bybit-bot-retrain.timer 2>/dev/null; then
-                    log_success "Retrain timer enabled (will run weekly on Sunday 3:00 AM)"
+                    log_success "Retrain timer enabled (will run weekly on Sunday 3:00 AM for model rotation)"
                 else
                     log_warn "Could not enable retrain timer (may need manual setup)"
                 fi
@@ -886,17 +929,25 @@ EOF
             log_warn "Could not copy service files to /etc/systemd/system/ (may need sudo privileges)"
             log_info "Copy manually:"
             echo "  sudo cp $SYSTEMD_DIR/bybit-bot-live.service /etc/systemd/system/"
+            echo "  sudo cp $SYSTEMD_DIR/bybit-bot-train-queue.service /etc/systemd/system/"
+            echo "  sudo cp $SYSTEMD_DIR/bybit-bot-train-queue.timer /etc/systemd/system/"
             echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.service /etc/systemd/system/"
             echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.timer /etc/systemd/system/"
             echo "  sudo systemctl daemon-reload"
+            echo "  sudo systemctl enable bybit-bot-train-queue.timer"
+            echo "  sudo systemctl enable bybit-bot-retrain.timer"
         fi
     else
         log_warn "sudo command not found. Cannot install systemd services automatically."
         log_info "Install manually as root:"
         echo "  cp $SYSTEMD_DIR/bybit-bot-live.service /etc/systemd/system/"
+        echo "  cp $SYSTEMD_DIR/bybit-bot-train-queue.service /etc/systemd/system/"
+        echo "  cp $SYSTEMD_DIR/bybit-bot-train-queue.timer /etc/systemd/system/"
         echo "  cp $SYSTEMD_DIR/bybit-bot-retrain.service /etc/systemd/system/"
         echo "  cp $SYSTEMD_DIR/bybit-bot-retrain.timer /etc/systemd/system/"
         echo "  systemctl daemon-reload"
+        echo "  systemctl enable bybit-bot-train-queue.timer"
+        echo "  systemctl enable bybit-bot-retrain.timer"
     fi
     echo ""
     

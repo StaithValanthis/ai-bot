@@ -551,7 +551,8 @@ def main():
     parser.add_argument('--symbols', nargs='+', help='Symbols to retrain (default: from config)')
     parser.add_argument('--dry-run', action='store_true', help='Dry run mode (no actual rotation or training)')
     parser.add_argument('--config', type=str, default='config/config.yaml', help='Config file')
-    parser.add_argument('--skip-queue', action='store_true', help='Skip processing training queue')
+    parser.add_argument('--skip-queue', action='store_true', help='Skip processing training queue (only do model rotation)')
+    parser.add_argument('--skip-retrain', action='store_true', help='Skip model rotation (only process training queue)')
     
     args = parser.parse_args()
     
@@ -559,7 +560,12 @@ def main():
     logger.add("logs/retrain_{time}.log", rotation="1 day", level="INFO")
     
     logger.info("=" * 60)
-    logger.info("Starting Model Retraining & Rotation")
+    if args.skip_retrain:
+        logger.info("Processing Training Queue Only")
+    elif args.skip_queue:
+        logger.info("Model Retraining & Rotation Only")
+    else:
+        logger.info("Starting Model Retraining & Rotation")
     logger.info("=" * 60)
     
     # Load config
@@ -576,26 +582,29 @@ def main():
         logger.info("Skipping training queue processing (--skip-queue flag)")
     
     # Get symbols for retraining
-    if args.symbols:
-        symbols = args.symbols
-    else:
-        symbols = config.get('trading', {}).get('symbols', [])
-    
-    # Initialize rotation manager
-    rotation_manager = ModelRotationManager(config)
-    
     retrain_results = {}
-    if rotation_manager.enabled:
-        # Retrain each symbol
-        for symbol in symbols:
-            try:
-                rotated = rotation_manager.retrain_and_rotate(symbol, dry_run=args.dry_run)
-                retrain_results[symbol] = "ROTATED" if rotated else "SKIPPED"
-            except Exception as e:
-                logger.error(f"Error retraining {symbol}: {e}")
-                retrain_results[symbol] = "ERROR"
+    if not args.skip_retrain:
+        if args.symbols:
+            symbols = args.symbols
+        else:
+            symbols = config.get('trading', {}).get('symbols', [])
+        
+        # Initialize rotation manager
+        rotation_manager = ModelRotationManager(config)
+        
+        if rotation_manager.enabled:
+            # Retrain each symbol
+            for symbol in symbols:
+                try:
+                    rotated = rotation_manager.retrain_and_rotate(symbol, dry_run=args.dry_run)
+                    retrain_results[symbol] = "ROTATED" if rotated else "SKIPPED"
+                except Exception as e:
+                    logger.error(f"Error retraining {symbol}: {e}")
+                    retrain_results[symbol] = "ERROR"
+        else:
+            logger.warning("Model rotation is disabled in config")
     else:
-        logger.warning("Model rotation is disabled in config")
+        logger.info("Skipping model rotation (--skip-retrain flag)")
     
     # Summary
     logger.info("=" * 60)

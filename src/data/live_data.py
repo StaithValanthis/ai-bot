@@ -49,14 +49,31 @@ class LiveDataStream:
     def _handle_message(self, message: dict):
         """Handle incoming WebSocket message"""
         try:
+            # Log first message to verify connection is working
+            if not hasattr(self, '_first_message_logged'):
+                logger.info(f"WebSocket connection active - received first message: {message.get('topic', 'unknown')}")
+                self._first_message_logged = True
+            
             topic = message.get('topic', '')
+            
+            # Handle ping/pong messages (pybit may send these)
+            if 'ping' in topic.lower() or message.get('op') == 'ping':
+                logger.debug("Received ping message")
+                return
             
             if 'kline' in topic:
                 data = message.get('data', [])
                 if not data:
+                    logger.debug(f"Received kline message with empty data: {message}")
                     return
                 
-                kline = data[0] if isinstance(data, list) else data
+                # Handle both list and dict formats
+                if isinstance(data, list):
+                    if len(data) == 0:
+                        return
+                    kline = data[0]
+                else:
+                    kline = data
                 
                 # Extract symbol from kline data or topic
                 # Topic format: "kline.{interval}.{symbol}" or symbol might be in kline dict
@@ -88,14 +105,19 @@ class LiveDataStream:
                 # Update buffer
                 self.candle_buffer[symbol] = candle
                 
-                # Only log closed candles (open candle updates are too frequent and noisy)
-                # Call callback if candle is closed
-                if candle['is_closed'] and self.callback:
+                # Log all closed candles (for debugging - can reduce later)
+                if candle['is_closed']:
                     logger.info(f"Closed candle for {symbol}: {candle['close']:.2f} @ {candle['timestamp']}")
-                    df = pd.DataFrame([candle])
-                    self.callback(df)
-                # Open candle updates are not logged to reduce log spam
-                # They're still stored in buffer for real-time price tracking
+                    if self.callback:
+                        df = pd.DataFrame([candle])
+                        self.callback(df)
+                else:
+                    # Log open candle updates occasionally (every 10th update per symbol)
+                    if not hasattr(self, '_open_candle_count'):
+                        self._open_candle_count = {}
+                    self._open_candle_count[symbol] = self._open_candle_count.get(symbol, 0) + 1
+                    if self._open_candle_count[symbol] % 10 == 0:
+                        logger.debug(f"Open candle update for {symbol}: {candle['close']:.2f}")
         
         except KeyError as e:
             # Log more details about the message structure for debugging
@@ -109,7 +131,8 @@ class LiveDataStream:
             logger.error(
                 f"Error handling WebSocket message: {e}. "
                 f"Message type: {type(message)}, "
-                f"Message keys: {list(message.keys()) if isinstance(message, dict) else 'N/A'}"
+                f"Message keys: {list(message.keys()) if isinstance(message, dict) else 'N/A'}, "
+                f"Full message: {message}"
             )
     
     def start(self):
@@ -123,18 +146,33 @@ class LiveDataStream:
             
             # Subscribe to kline streams
             # For pybit WebSocket, we need to subscribe to each symbol with interval
+            subscribed_count = 0
             for symbol in self.symbols:
-                self.ws.kline_stream(
-                    callback=self._handle_message,
-                    symbol=symbol,
-                    interval=self.interval  # Required parameter
-                )
+                try:
+                    self.ws.kline_stream(
+                        callback=self._handle_message,
+                        symbol=symbol,
+                        interval=self.interval  # Required parameter
+                    )
+                    subscribed_count += 1
+                    logger.debug(f"Subscribed to {symbol} kline stream")
+                except Exception as e:
+                    logger.error(f"Failed to subscribe to {symbol}: {e}")
+            
+            if subscribed_count == 0:
+                logger.error("Failed to subscribe to any symbols!")
+                self.running = False
+                return
             
             self.running = True
-            logger.info(f"Started WebSocket stream for {self.symbols}")
+            logger.info(f"Started WebSocket stream for {subscribed_count}/{len(self.symbols)} symbols")
+            
+            # Log a warning if not all symbols were subscribed
+            if subscribed_count < len(self.symbols):
+                logger.warning(f"Only subscribed to {subscribed_count} out of {len(self.symbols)} symbols")
             
         except Exception as e:
-            logger.error(f"Error starting WebSocket: {e}")
+            logger.error(f"Error starting WebSocket: {e}", exc_info=True)
             self.running = False
     
     def stop(self):
