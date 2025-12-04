@@ -660,10 +660,20 @@ try:
     config['exchange']['universe_mode'] = universe_mode
     
     if universe_mode == 'auto':
-        if min_volume:
-            config['exchange']['min_usd_volume_24h'] = int(min_volume)
-        if max_symbols:
-            config['exchange']['max_symbols'] = int(max_symbols)
+        if min_volume and min_volume.strip():
+            try:
+                config['exchange']['min_usd_volume_24h'] = int(min_volume)
+            except ValueError:
+                print(f"Warning: Invalid min_volume value: {min_volume}", file=sys.stderr)
+        if max_symbols and max_symbols.strip():
+            try:
+                max_symbols_int = int(max_symbols)
+                config['exchange']['max_symbols'] = max_symbols_int
+                print(f"DEBUG: Set max_symbols to {max_symbols_int} (from input: '{max_symbols}')", file=sys.stderr)
+            except ValueError:
+                print(f"Warning: Invalid max_symbols value: {max_symbols}", file=sys.stderr)
+        else:
+            print(f"DEBUG: max_symbols not set (value: '{max_symbols}')", file=sys.stderr)
     
     # Ensure model section exists
     if 'model' not in config:
@@ -696,8 +706,10 @@ try:
     print(f"Updated config.yaml:")
     print(f"  universe_mode={universe_mode}")
     if universe_mode == 'auto':
-        print(f"  min_usd_volume_24h={min_volume}")
-        print(f"  max_symbols={max_symbols}")
+        if min_volume and min_volume.strip():
+            print(f"  min_usd_volume_24h={min_volume}")
+        if max_symbols and max_symbols.strip():
+            print(f"  max_symbols={max_symbols}")
     print(f"  model.training_mode={training_mode}")
     print(f"  model.symbol_encoding={symbol_encoding}")
     if training_mode == 'multi_symbol' and multi_symbol_symbols:
@@ -810,28 +822,82 @@ EOF
     
     log_success "Systemd service files created in $SYSTEMD_DIR"
     echo ""
-    log_info "To enable these services, run the following commands as root:"
-    echo ""
-    echo "  # Copy service files"
-    echo "  sudo cp $SYSTEMD_DIR/bybit-bot-live.service /etc/systemd/system/"
-    echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.service /etc/systemd/system/"
-    echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.timer /etc/systemd/system/"
-    echo ""
-    echo "  # Reload systemd"
-    echo "  sudo systemctl daemon-reload"
-    echo ""
-    echo "  # Enable and start services (DO NOT START LIVE BOT YET!)"
-    echo "  # sudo systemctl enable bybit-bot-retrain.timer"
-    echo "  # sudo systemctl start bybit-bot-retrain.timer"
-    echo ""
-    echo "  # For live bot (ONLY after testnet validation):"
-    echo "  # sudo systemctl enable bybit-bot-live.service"
-    echo "  # sudo systemctl start bybit-bot-live.service"
-    echo ""
-    log_warn "DO NOT start the live bot service until you have:"
-    log_warn "  1. Completed testnet validation (2+ weeks)"
-    log_warn "  2. Reviewed and adjusted configuration"
-    log_warn "  3. Verified all safety controls are active"
+    
+    # Copy service files to systemd directory and reload
+    log_info "Installing systemd services..."
+    if command -v sudo &> /dev/null; then
+        # Copy service files
+        if sudo cp "$SYSTEMD_DIR/bybit-bot-live.service" /etc/systemd/system/ 2>/dev/null && \
+           sudo cp "$SYSTEMD_DIR/bybit-bot-retrain.service" /etc/systemd/system/ 2>/dev/null && \
+           sudo cp "$SYSTEMD_DIR/bybit-bot-retrain.timer" /etc/systemd/system/ 2>/dev/null; then
+            log_success "Service files copied to /etc/systemd/system/"
+            
+            # Reload systemd
+            if sudo systemctl daemon-reload 2>/dev/null; then
+                log_success "Systemd daemon reloaded"
+                
+                # Enable retrain timer (safe to enable, won't start until scheduled)
+                if sudo systemctl enable bybit-bot-retrain.timer 2>/dev/null; then
+                    log_success "Retrain timer enabled (will run weekly on Sunday 3:00 AM)"
+                else
+                    log_warn "Could not enable retrain timer (may need manual setup)"
+                fi
+                
+                # Prompt about starting live bot service
+                echo ""
+                log_warn "IMPORTANT: Do NOT start the live bot service until you have:"
+                log_warn "  1. Completed testnet validation (2+ weeks minimum)"
+                log_warn "  2. Reviewed and adjusted configuration"
+                log_warn "  3. Verified all safety controls are active"
+                echo ""
+                
+                if prompt_yes_no "Do you want to enable the live bot service to start on boot? (service will NOT start now)" "N"; then
+                    if sudo systemctl enable bybit-bot-live.service 2>/dev/null; then
+                        log_success "Live bot service enabled (will start on boot)"
+                        log_info "Service is enabled but NOT started. Start manually when ready:"
+                        echo "  sudo systemctl start bybit-bot-live.service"
+                    else
+                        log_warn "Could not enable live bot service (may need manual setup)"
+                    fi
+                else
+                    log_info "Live bot service NOT enabled. Enable manually when ready:"
+                    echo "  sudo systemctl enable bybit-bot-live.service"
+                fi
+                
+                # Ask if user wants to start the service now (with strong warning)
+                echo ""
+                if prompt_yes_no "Do you want to START the live bot service NOW? (NOT RECOMMENDED - only if you've completed testnet validation)" "N"; then
+                    log_warn "Starting live bot service..."
+                    if sudo systemctl start bybit-bot-live.service 2>/dev/null; then
+                        log_success "Live bot service started"
+                        log_info "Monitor logs with: sudo journalctl -u bybit-bot-live.service -f"
+                    else
+                        log_error "Failed to start live bot service. Check logs: sudo journalctl -u bybit-bot-live.service"
+                    fi
+                else
+                    log_info "Live bot service NOT started. Start manually when ready:"
+                    echo "  sudo systemctl start bybit-bot-live.service"
+                fi
+            else
+                log_warn "Could not reload systemd daemon (may need manual setup)"
+                log_info "Run manually: sudo systemctl daemon-reload"
+            fi
+        else
+            log_warn "Could not copy service files to /etc/systemd/system/ (may need sudo privileges)"
+            log_info "Copy manually:"
+            echo "  sudo cp $SYSTEMD_DIR/bybit-bot-live.service /etc/systemd/system/"
+            echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.service /etc/systemd/system/"
+            echo "  sudo cp $SYSTEMD_DIR/bybit-bot-retrain.timer /etc/systemd/system/"
+            echo "  sudo systemctl daemon-reload"
+        fi
+    else
+        log_warn "sudo command not found. Cannot install systemd services automatically."
+        log_info "Install manually as root:"
+        echo "  cp $SYSTEMD_DIR/bybit-bot-live.service /etc/systemd/system/"
+        echo "  cp $SYSTEMD_DIR/bybit-bot-retrain.service /etc/systemd/system/"
+        echo "  cp $SYSTEMD_DIR/bybit-bot-retrain.timer /etc/systemd/system/"
+        echo "  systemctl daemon-reload"
+    fi
     echo ""
     
     # Cron alternative

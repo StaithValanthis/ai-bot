@@ -250,6 +250,18 @@ class TradingBot:
     
     def _check_model_coverage(self):
         """Check model coverage and block untrained symbols, including history requirements"""
+        # Reload model first to ensure we have latest trained_symbols
+        try:
+            from src.config.config_loader import get_model_paths
+            model_paths = get_model_paths(self.config)
+            self.meta_predictor = MetaPredictor(
+                model_path=str(model_paths['model']),
+                scaler_path=str(model_paths['scaler']),
+                config_path=str(model_paths['config'])
+            )
+        except Exception as e:
+            logger.warning(f"Could not reload model for coverage check: {e}")
+        
         model_config = self.config.get('model', {})
         block_untrained = model_config.get('block_untrained_symbols', True)
         block_short_history = model_config.get('block_short_history_symbols', True)
@@ -284,6 +296,12 @@ class TradingBot:
             )
             
             for symbol in untrained_symbols:
+                # FIXED: Skip if already training this symbol (prevents re-queuing)
+                with self.training_lock:
+                    if symbol in self.training_threads and self.training_threads[symbol].is_alive():
+                        logger.debug(f"Symbol {symbol} is already being trained in background, skipping re-queue")
+                        continue
+                
                 # Try to load existing data
                 df = data_collector.load_candles(
                     symbol=symbol,
@@ -307,14 +325,20 @@ class TradingBot:
                 
                 # Check minimum history requirement
                 if block_short_history and available_days < min_history_days:
-                    logger.warning(f"Symbol {symbol}: Only {available_days} days of history (< {min_history_days} minimum). Blocking.")
+                    logger.warning(
+                        f"Symbol {symbol}: Only {available_days:.1f} days of history (< {min_history_days} minimum). "
+                        f"Permanently blocked until sufficient history accumulates. Will NOT trigger retraining."
+                    )
                     self.blocked_symbols.add(symbol)
                     symbols_blocked_short_history.add(symbol)
                     continue
                 
                 # Check coverage requirement
                 if coverage_pct < min_coverage_pct:
-                    logger.warning(f"Symbol {symbol}: {coverage_pct*100:.1f}% coverage (< {min_coverage_pct*100}% required). Blocking.")
+                    logger.warning(
+                        f"Symbol {symbol}: {coverage_pct*100:.1f}% coverage (< {min_coverage_pct*100}% required). "
+                        f"Permanently blocked until data coverage improves. Will NOT trigger retraining."
+                    )
                     self.blocked_symbols.add(symbol)
                     continue
                 
@@ -1207,14 +1231,20 @@ class TradingBot:
             last_heartbeat = time.time()
             heartbeat_interval = 600  # Log heartbeat every 10 minutes
             
+            # Timer for periodic training/coverage checks (every 5 minutes)
+            training_check_interval = 300  # 5 minutes
+            last_training_check = time.time()
+            
             logger.info(f"Main loop started. Health checks every {health_check_interval}s, heartbeat every {heartbeat_interval}s")
+            logger.info(f"Training/coverage checks every {training_check_interval}s")
             logger.info(f"Active symbols: {len(symbols) - len(self.blocked_symbols)} tradable, {len(self.blocked_symbols)} blocked")
             
             while self.running:
                 time.sleep(60)  # Check every minute
                 
-                # Periodic heartbeat (every 10 minutes)
                 current_time = time.time()
+                
+                # Periodic heartbeat (every 10 minutes)
                 if (current_time - last_heartbeat) >= heartbeat_interval:
                     last_heartbeat = current_time
                     active_count = len(symbols) - len(self.blocked_symbols)
@@ -1249,86 +1279,110 @@ class TradingBot:
                         break
                 
                 # Periodic check for completed training and re-evaluate blocked symbols (every 5 minutes)
+                # FIXED: Added timer check to prevent running every loop iteration
                 # This allows symbols to be unblocked after background training completes
                 # Also re-checks symbols blocked due to insufficient history
-                if hasattr(self, 'training_threads') and self.training_threads:
-                    # Check for completed threads and unblock symbols
-                    completed_symbols = []
-                    with self.training_lock:
-                        for symbol, thread in list(self.training_threads.items()):
-                            if not thread.is_alive():
-                                completed_symbols.append(symbol)
+                if (current_time - last_training_check) >= training_check_interval:
+                    last_training_check = current_time
+                    logger.debug("Running periodic training/coverage check...")
                     
-                    if completed_symbols:
-                        logger.info(f"Detected {len(completed_symbols)} completed training thread(s), checking for symbol unblocking...")
-                        # Reload model to ensure we have latest trained_symbols
-                        try:
-                            from src.config.config_loader import get_model_paths
-                            model_paths = get_model_paths(self.config)
-                            self.meta_predictor = MetaPredictor(
-                                model_path=str(model_paths['model']),
-                                scaler_path=str(model_paths['scaler']),
-                                config_path=str(model_paths['config'])
-                            )
-                            logger.debug("Model reloaded to check for newly trained symbols")
-                        except Exception as e:
-                            logger.warning(f"Could not reload model for unblocking check: {e}")
+                    # Check for completed training threads and unblock symbols
+                    if hasattr(self, 'training_threads') and self.training_threads:
+                        completed_symbols = []
+                        with self.training_lock:
+                            for symbol, thread in list(self.training_threads.items()):
+                                if not thread.is_alive():
+                                    completed_symbols.append(symbol)
                         
-                        # Check and unblock symbols
-                        self._check_and_unblock_symbols()
-                
-                # Periodic re-evaluation of blocked symbols (every 5 minutes)
-                # Check if symbols blocked due to insufficient history now have enough data
-                if hasattr(self, 'blocked_symbols') and self.blocked_symbols:
-                    model_config = self.config.get('model', {})
-                    auto_train = model_config.get('auto_train_new_symbols', True)
-                    block_short_history = model_config.get('block_short_history_symbols', True)
-                    min_history_days = model_config.get('min_history_days_to_train', 90)
-                    min_coverage_pct = model_config.get('min_history_coverage_pct', 0.95)
+                        if completed_symbols:
+                            logger.info(f"Detected {len(completed_symbols)} completed training thread(s), checking for symbol unblocking...")
+                            # Reload model to ensure we have latest trained_symbols
+                            try:
+                                from src.config.config_loader import get_model_paths
+                                model_paths = get_model_paths(self.config)
+                                self.meta_predictor = MetaPredictor(
+                                    model_path=str(model_paths['model']),
+                                    scaler_path=str(model_paths['scaler']),
+                                    config_path=str(model_paths['config'])
+                                )
+                                logger.debug("Model reloaded to check for newly trained symbols")
+                            except Exception as e:
+                                logger.warning(f"Could not reload model for unblocking check: {e}")
+                            
+                            # Check and unblock symbols
+                            self._check_and_unblock_symbols()
                     
-                    if auto_train and block_short_history:
-                        # Re-check blocked symbols to see if they now have enough history
-                        symbols_to_retry = set()
-                        from src.data.historical_data import HistoricalDataCollector
-                        data_collector = HistoricalDataCollector(
-                            api_key=self.config['exchange'].get('api_key'),
-                            api_secret=self.config['exchange'].get('api_secret'),
-                            testnet=self.config['exchange'].get('testnet', True)
-                        )
+                    # Periodic re-evaluation of blocked symbols (every 5 minutes)
+                    # FIXED: Only runs every 5 minutes, not every loop iteration
+                    # Check if symbols blocked due to insufficient history now have enough data
+                    if hasattr(self, 'blocked_symbols') and self.blocked_symbols:
+                        model_config = self.config.get('model', {})
+                        auto_train = model_config.get('auto_train_new_symbols', True)
+                        block_short_history = model_config.get('block_short_history_symbols', True)
+                        min_history_days = model_config.get('min_history_days_to_train', 90)
+                        min_coverage_pct = model_config.get('min_history_coverage_pct', 0.95)
                         
-                        for symbol in list(self.blocked_symbols):
-                            # Skip if already training
-                            with self.training_lock:
-                                if symbol in self.training_threads and self.training_threads[symbol].is_alive():
-                                    continue
+                        if auto_train and block_short_history:
+                            # Reload model first to ensure we have latest trained_symbols
+                            try:
+                                from src.config.config_loader import get_model_paths
+                                model_paths = get_model_paths(self.config)
+                                self.meta_predictor = MetaPredictor(
+                                    model_path=str(model_paths['model']),
+                                    scaler_path=str(model_paths['scaler']),
+                                    config_path=str(model_paths['config'])
+                                )
+                            except Exception as e:
+                                logger.warning(f"Could not reload model for coverage check: {e}")
                             
-                            # Check if symbol is now trained (might have been trained by another process)
-                            if symbol in self.meta_predictor.trained_symbols:
-                                self.blocked_symbols.remove(symbol)
-                                logger.info(f"Symbol {symbol} is now trained, unblocking")
-                                continue
-                            
-                            # Re-check history requirements
-                            df = data_collector.load_candles(
-                                symbol=symbol,
-                                timeframe="60",
-                                data_path=self.config['data']['historical_data_path']
+                            # Re-check blocked symbols to see if they now have enough history
+                            symbols_to_retry = set()
+                            from src.data.historical_data import HistoricalDataCollector
+                            data_collector = HistoricalDataCollector(
+                                api_key=self.config['exchange'].get('api_key'),
+                                api_secret=self.config['exchange'].get('api_secret'),
+                                testnet=self.config['exchange'].get('testnet', True)
                             )
                             
-                            if not df.empty:
-                                history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
-                                available_days = history_metrics['available_days']
-                                coverage_pct = history_metrics['coverage_pct']
+                            for symbol in list(self.blocked_symbols):
+                                # Skip if already training
+                                with self.training_lock:
+                                    if symbol in self.training_threads and self.training_threads[symbol].is_alive():
+                                        continue
                                 
-                                # If now meets requirements, queue for training
-                                if available_days >= min_history_days and coverage_pct >= min_coverage_pct:
-                                    logger.info(f"Symbol {symbol} now has sufficient history ({available_days:.1f} days, {coverage_pct*100:.1f}% coverage), queuing for training")
-                                    symbols_to_retry.add(symbol)
-                        
-                        # Train symbols that now meet requirements
-                        if symbols_to_retry:
-                            logger.info(f"Re-evaluated {len(symbols_to_retry)} blocked symbol(s), {len(symbols_to_retry)} now eligible for training")
-                            self._train_symbols_in_background(symbols_to_retry)
+                                # Check if symbol is now trained (might have been trained by another process)
+                                if symbol in self.meta_predictor.trained_symbols:
+                                    self.blocked_symbols.remove(symbol)
+                                    logger.info(f"Symbol {symbol} is now trained, unblocking")
+                                    continue
+                                
+                                # Re-check history requirements
+                                df = data_collector.load_candles(
+                                    symbol=symbol,
+                                    timeframe="60",
+                                    data_path=self.config['data']['historical_data_path']
+                                )
+                                
+                                if not df.empty:
+                                    history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
+                                    available_days = history_metrics['available_days']
+                                    coverage_pct = history_metrics['coverage_pct']
+                                    
+                                    # If now meets requirements AND not already trained, queue for training
+                                    if available_days >= min_history_days and coverage_pct >= min_coverage_pct:
+                                        # Double-check it's not trained (race condition protection)
+                                        if symbol not in self.meta_predictor.trained_symbols:
+                                            logger.info(f"Symbol {symbol} now has sufficient history ({available_days:.1f} days, {coverage_pct*100:.1f}% coverage), queuing for training")
+                                            symbols_to_retry.add(symbol)
+                                        else:
+                                            # Symbol was trained between checks, unblock it
+                                            self.blocked_symbols.remove(symbol)
+                                            logger.info(f"Symbol {symbol} is now trained (detected during re-evaluation), unblocking")
+                            
+                            # Train symbols that now meet requirements
+                            if symbols_to_retry:
+                                logger.info(f"Re-evaluated {len(symbols_to_retry)} blocked symbol(s), {len(symbols_to_retry)} now eligible for training")
+                                self._train_symbols_in_background(symbols_to_retry)
                 
                 # Periodic health check (every N seconds as configured)
                 current_time = time.time()

@@ -285,10 +285,24 @@ def get_model_info(model: Dict[str, Any]) -> str:
     
     if metadata.get('performance'):
         perf = metadata['performance']
-        info_lines.append(f"Performance: Precision={perf.get('precision', 'N/A'):.3f}, "
-                         f"Recall={perf.get('recall', 'N/A'):.3f}, "
-                         f"F1={perf.get('f1', 'N/A'):.3f}, "
-                         f"AUC={perf.get('auc', 'N/A'):.3f}")
+        # Format performance metrics, handling both numeric and string values
+        def format_metric(value, default='N/A'):
+            if value == default or value is None:
+                return default
+            try:
+                return f"{float(value):.3f}"
+            except (ValueError, TypeError):
+                return str(value)
+        
+        precision = format_metric(perf.get('precision'), 'N/A')
+        recall = format_metric(perf.get('recall'), 'N/A')
+        f1 = format_metric(perf.get('f1'), 'N/A')
+        auc = format_metric(perf.get('auc'), 'N/A')
+        
+        info_lines.append(f"Performance: Precision={precision}, "
+                         f"Recall={recall}, "
+                         f"F1={f1}, "
+                         f"AUC={auc}")
     
     return "\n".join(info_lines)
 
