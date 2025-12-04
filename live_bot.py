@@ -471,7 +471,9 @@ class TradingBot:
             except:
                 pass
         
-        # Process signal
+        # Process signal (callback is only called for closed candles by WebSocket handler)
+        # The WebSocket handler in live_data.py only calls callback when is_closed=True
+        # So by the time we get here, the candle should be closed
         self._process_signal(symbol)
     
     def _process_signal(self, symbol: str):
@@ -502,8 +504,19 @@ class TradingBot:
             # Generate primary signal
             primary_signal = self.primary_signal_gen.generate_signal(df_with_features)
             
+            # Log signal generation for visibility
             if primary_signal['direction'] == 'NEUTRAL':
+                # Log occasionally to show the bot is evaluating signals
+                import random
+                if random.random() < 0.05:  # 5% chance to log NEUTRAL signals (reduce spam)
+                    logger.debug(f"[{symbol}] Signal evaluation: NEUTRAL (no trend signal detected)")
                 return
+            
+            # Log non-neutral signals (these are candidates for trading)
+            logger.info(
+                f"[{symbol}] ✓ Primary signal generated: {primary_signal['direction']} "
+                f"(strength: {primary_signal.get('strength', 'N/A')}) - Evaluating filters..."
+            )
             
             # Regime filter check
             regime_allowed, regime_reason, regime_multiplier = self.regime_filter.should_allow_trade(
@@ -585,7 +598,15 @@ class TradingBot:
             confidence_adjustment = self.performance_guard.get_confidence_adjustment()
             adjusted_threshold = base_threshold + confidence_adjustment
             
-            # Log signal
+            # Log signal evaluation
+            logger.info(
+                f"[{symbol}] Signal evaluation: {primary_signal['direction']} | "
+                f"Confidence: {confidence:.3f} | "
+                f"Threshold: {adjusted_threshold:.3f} (base: {base_threshold:.3f} + adj: {confidence_adjustment:.3f}) | "
+                f"Regime: {regime_reason if 'regime_reason' in locals() else 'OK'}"
+            )
+            
+            # Log signal to trade logger
             self.trade_logger.log_signal(
                 symbol=symbol,
                 direction=primary_signal['direction'],
@@ -595,8 +616,17 @@ class TradingBot:
             
             # Check confidence threshold
             if confidence < adjusted_threshold:
-                logger.info(f"Signal filtered: confidence {confidence:.2f} < threshold {adjusted_threshold:.2f} (base: {base_threshold:.2f} + adj: {confidence_adjustment:.2f})")
+                logger.info(
+                    f"[{symbol}] Signal filtered: confidence {confidence:.3f} < threshold {adjusted_threshold:.3f} "
+                    f"(needs {adjusted_threshold - confidence:.3f} more confidence)"
+                )
                 return
+            
+            # Log that signal passed all filters and will attempt trade
+            logger.info(
+                f"[{symbol}] ✓ Signal passed all filters! Attempting trade: {primary_signal['direction']} "
+                f"@ {df_with_features['close'].iloc[-1]:.2f} (confidence: {confidence:.3f})"
+            )
             
             # Get volatility for position sizing (before execute_trade)
             current_volatility = None
@@ -911,8 +941,8 @@ class TradingBot:
         
         logger.info(f"Bot running. Monitoring {len(symbols)} symbols: {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
         logger.info("Press Ctrl+C to stop")
-        logger.info("Waiting for WebSocket data... (hourly candles may take up to 60 minutes to close)")
-        logger.info("Waiting for WebSocket data... (this may take a few minutes for hourly candles)")
+        logger.info("IMPORTANT: Hourly candles only close at the top of each hour (e.g., 09:00, 10:00, 11:00)")
+        logger.info("Signals are only processed when candles CLOSE. Open candle updates are received but not processed.")
         
         # Initialize portfolio selector (if enabled)
         if self.portfolio_selector.enabled:
@@ -948,11 +978,30 @@ class TradingBot:
                     if hasattr(self, 'stream') and self.stream:
                         ws_status = "RUNNING" if self.stream.is_running() else "STOPPED"
                     
+                    # Count symbols with enough history for signal processing
+                    symbols_with_enough_data = sum(
+                        1 for s in symbols 
+                        if s in self.candle_data and len(self.candle_data[s]) >= 50
+                    )
+                    
+                    # Count recent signals evaluated (from cache)
+                    recent_signals = len(self.symbol_confidence_cache)
+                    
                     logger.info(
                         f"Bot heartbeat: {tradable_count} tradable symbols, {blocked_count} blocked, "
                         f"{positions_count} open positions, {candles_received} symbols with data, "
+                        f"{symbols_with_enough_data} symbols with enough history (≥50 candles), "
+                        f"{recent_signals} symbols with recent signal evaluations, "
                         f"WebSocket: {ws_status}"
                     )
+                    
+                    # Log reminder about hourly candles and signal processing
+                    if candles_received > 0 and positions_count == 0 and recent_signals == 0:
+                        logger.info(
+                            "ℹ️  Note: Hourly candles only close at the top of each hour (e.g., 09:00, 10:00, 11:00). "
+                            "Signals are only processed when candles CLOSE. "
+                            "Open candle updates are received but signals are not evaluated until candle closes."
+                        )
                     
                     # Warn if no data received after 10 minutes
                     elapsed_minutes = (current_time - self.start_time) / 60
@@ -960,8 +1009,7 @@ class TradingBot:
                         logger.warning(
                             f"No candle data received after {elapsed_minutes:.1f} minutes. "
                             f"WebSocket status: {ws_status}. "
-                            f"Check WebSocket connection and subscriptions. "
-                            f"Note: Hourly candles only close at the top of each hour."
+                            f"Check WebSocket connection and subscriptions."
                         )
                 
                 # Monitor positions
