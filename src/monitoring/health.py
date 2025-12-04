@@ -106,16 +106,18 @@ class HealthMonitor:
         
         # Check data feed
         data_feed_ok = True
-        for symbol, last_time in self.last_candle_time.items():
-            if last_time:
-                gap_minutes = (now - last_time).total_seconds() / 60
-                if gap_minutes > self.max_candle_gap_minutes:
-                    status['issues'].append(f"Data feed stalled for {symbol}: {gap_minutes:.1f} minutes")
-                    status['health_status'] = 'DEGRADED'
-                    data_feed_ok = False
-        
         if not self.last_candle_time:
-            status['warnings'].append("No candle data received yet")
+            # On startup, this is normal - just a warning, not an issue
+            status['warnings'].append("No candle data received yet (startup)")
+        else:
+            # Check for stalled data feeds
+            for symbol, last_time in self.last_candle_time.items():
+                if last_time:
+                    gap_minutes = (now - last_time).total_seconds() / 60
+                    if gap_minutes > self.max_candle_gap_minutes:
+                        status['issues'].append(f"Data feed stalled for {symbol}: {gap_minutes:.1f} minutes")
+                        status['health_status'] = 'DEGRADED'
+                        data_feed_ok = False
         
         # Check API errors
         if self.api_error_count >= self.max_api_errors:

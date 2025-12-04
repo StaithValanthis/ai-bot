@@ -987,7 +987,77 @@ PYTHON_SCRIPT
     fi
 fi
 
-if prompt_yes_no "Do you want to train an initial model now?" "N"; then
+# Check for existing compatible model before prompting
+log_info "Checking for existing compatible model..."
+if [[ -d "$VENV_PATH" ]]; then
+    source "$VENV_PATH/bin/activate"
+    cd "$SCRIPT_DIR"
+    load_env_file "$SCRIPT_DIR/.env"
+    export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    
+    EXISTING_MODEL_INFO=$(python3 <<PYTHON_SCRIPT
+import sys
+import json
+from src.config.config_loader import load_config
+from src.models.model_registry import select_best_model, get_model_info
+
+try:
+    config = load_config()
+    existing_model = select_best_model(config)
+    if existing_model:
+        print(json.dumps({
+            'found': True,
+            'version': existing_model['version'],
+            'info': get_model_info(existing_model)
+        }))
+    else:
+        print(json.dumps({'found': False}))
+except Exception as e:
+    print(json.dumps({'found': False, 'error': str(e)}))
+PYTHON_SCRIPT
+)
+    
+    deactivate 2>/dev/null || true
+    
+    if [[ -n "$EXISTING_MODEL_INFO" ]]; then
+        MODEL_FOUND=$(echo "$EXISTING_MODEL_INFO" | python3 -c "import sys, json; d=json.load(sys.stdin); print('true' if d.get('found') else 'false')" 2>/dev/null || echo "false")
+        
+        if [[ "$MODEL_FOUND" == "true" ]]; then
+            MODEL_VERSION=$(echo "$EXISTING_MODEL_INFO" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('version', 'unknown'))" 2>/dev/null || echo "unknown")
+            MODEL_INFO=$(echo "$EXISTING_MODEL_INFO" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('info', ''))" 2>/dev/null || echo "")
+            
+            log_info "Compatible model found (version $MODEL_VERSION)"
+            echo ""
+            echo "$MODEL_INFO" | while IFS= read -r line; do
+                echo "  $line"
+            done
+            echo ""
+            
+            if prompt_yes_no "Do you want to retrain anyway (this will create a new version)?" "N"; then
+                FORCE_TRAIN_FLAG="--force-train"
+                log_info "Will force retraining (existing model will be preserved, new version created)"
+            else
+                log_info "Skipping training - will use existing model v$MODEL_VERSION"
+                FORCE_TRAIN_FLAG=""
+                SKIP_TRAINING=true
+            fi
+        else
+            log_info "No compatible model found - training will be required"
+            FORCE_TRAIN_FLAG=""
+            SKIP_TRAINING=false
+        fi
+    else
+        log_warn "Could not check for existing models - will proceed with training prompt"
+        FORCE_TRAIN_FLAG=""
+        SKIP_TRAINING=false
+    fi
+else
+    log_warn "Virtual environment not found, cannot check for existing models"
+    FORCE_TRAIN_FLAG=""
+    SKIP_TRAINING=false
+fi
+
+if [[ "${SKIP_TRAINING:-false}" != "true" ]] && prompt_yes_no "Do you want to train an initial model now?" "N"; then
     log_info "Training initial model (mode: $MODEL_TRAINING_MODE)..."
     
     # Determine symbols based on training mode
@@ -1062,13 +1132,13 @@ PYTHON_SCRIPT
             else
                 log_info "Training multi-symbol model using auto universe discovery..."
             fi
-            python3 train_model.py --days 730 || log_warn "Model training completed with warnings (check logs)"
+            python3 train_model.py --days 730 $FORCE_TRAIN_FLAG || log_warn "Model training completed with warnings (check logs)"
         else
             # Single-symbol training
             for SYMBOL in "${SYMBOLS_TO_TRAIN[@]}"; do
                 if [[ -n "$SYMBOL" ]]; then
                     log_info "Training single-symbol model for $SYMBOL..."
-                    python3 train_model.py --symbol "$SYMBOL" --days 730 || log_warn "Model training for $SYMBOL completed with warnings (check logs)"
+                    python3 train_model.py --symbol "$SYMBOL" --days 730 $FORCE_TRAIN_FLAG || log_warn "Model training for $SYMBOL completed with warnings (check logs)"
                 fi
             done
         fi

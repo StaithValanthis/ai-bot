@@ -95,6 +95,7 @@ except ImportError as e:
 from src.config.config_loader import load_config
 from src.data.historical_data import HistoricalDataCollector
 from src.models.train import ModelTrainer
+from src.models.model_registry import list_available_models, select_best_model, get_model_info
 from src.exchange.universe import UniverseManager
 from datetime import timedelta
 
@@ -103,8 +104,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train meta-model for trading bot')
     parser.add_argument('--symbol', type=str, default=None, help='Trading symbol (if not provided, uses universe or config)')
     parser.add_argument('--days', type=int, default=730, help='Number of days of history')
-    parser.add_argument('--version', type=str, default='1.0', help='Model version')
+    parser.add_argument('--version', type=str, default=None, help='Model version (default: from config or auto-increment)')
     parser.add_argument('--config', type=str, default='config/config.yaml', help='Config file path')
+    parser.add_argument('--force-train', action='store_true', help='Force training even if compatible model exists')
     
     args = parser.parse_args()
     
@@ -118,6 +120,39 @@ def main():
     # Load config
     config = load_config(args.config)
     logger.info(f"Loaded configuration from {args.config}")
+    
+    # Determine model version early (needed for compatibility check and saving)
+    if args.version:
+        model_version = args.version
+    else:
+        # Check for existing model to auto-increment version if forcing retrain
+        existing_model = select_best_model(config) if args.force_train else None
+        if existing_model and args.force_train:
+            # Auto-increment version when forcing retrain
+            existing_version = existing_model['version']
+            try:
+                parts = existing_version.split('.')
+                major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+                model_version = f"{major}.{minor + 1}"
+                logger.info(f"Auto-incrementing version: {existing_version} -> {model_version}")
+            except:
+                model_version = config.get('model', {}).get('version', '1.0')
+        else:
+            model_version = config.get('model', {}).get('version', '1.0')
+    
+    # Check for existing compatible model (unless --force-train is set)
+    if not args.force_train:
+        logger.info("Checking for existing compatible model...")
+        existing_model = select_best_model(config)
+        
+        if existing_model:
+            logger.info("=" * 60)
+            logger.info("Compatible model found - skipping training")
+            logger.info("=" * 60)
+            logger.info(f"\n{get_model_info(existing_model)}")
+            logger.info("\nTo force retraining, use --force-train flag")
+            logger.info("=" * 60)
+            return 0
     
     # Determine training mode and symbol(s) to train
     training_mode = config.get('model', {}).get('training_mode', 'single_symbol')
@@ -362,12 +397,12 @@ def main():
         scaler=scaler,
         metrics=metrics,
         features_df=features_df,
-        version=args.version
+        version=model_version
     )
     
     logger.info("=" * 60)
     logger.info("Training completed successfully!")
-    logger.info(f"Model version: {args.version}")
+    logger.info(f"Model version: {model_version}")
     logger.info(f"Performance metrics: {metrics}")
     logger.info("=" * 60)
     

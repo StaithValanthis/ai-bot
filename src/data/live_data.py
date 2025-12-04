@@ -53,35 +53,64 @@ class LiveDataStream:
             
             if 'kline' in topic:
                 data = message.get('data', [])
-                if data:
-                    kline = data[0]
-                    symbol = kline['symbol']
-                    
-                    # Convert to DataFrame format
-                    candle = {
-                        'timestamp': pd.to_datetime(int(kline['start']), unit='ms'),
-                        'open': float(kline['open']),
-                        'high': float(kline['high']),
-                        'low': float(kline['low']),
-                        'close': float(kline['close']),
-                        'volume': float(kline['volume']),
-                        'turnover': float(kline.get('turnover', 0)),
-                        'symbol': symbol,
-                        'timeframe': self.interval,
-                        'is_closed': kline.get('confirm', False)  # True when candle closes
-                    }
-                    
-                    # Update buffer
-                    self.candle_buffer[symbol] = candle
-                    
-                    # Call callback if candle is closed
-                    if candle['is_closed'] and self.callback:
-                        df = pd.DataFrame([candle])
-                        self.callback(df)
-                        logger.debug(f"New closed candle for {symbol}: {candle['close']}")
+                if not data:
+                    return
+                
+                kline = data[0] if isinstance(data, list) else data
+                
+                # Extract symbol from kline data or topic
+                # Topic format: "kline.{interval}.{symbol}" or symbol might be in kline dict
+                symbol = kline.get('symbol')
+                if not symbol:
+                    # Try to extract from topic: "kline.60.BTCUSDT"
+                    topic_parts = topic.split('.')
+                    if len(topic_parts) >= 3:
+                        symbol = topic_parts[-1]  # Last part is symbol
+                
+                if not symbol:
+                    logger.warning(f"Could not extract symbol from message: topic={topic}, data_keys={list(kline.keys()) if isinstance(kline, dict) else 'not_dict'}")
+                    return
+                
+                # Convert to DataFrame format
+                candle = {
+                    'timestamp': pd.to_datetime(int(kline['start']), unit='ms'),
+                    'open': float(kline['open']),
+                    'high': float(kline['high']),
+                    'low': float(kline['low']),
+                    'close': float(kline['close']),
+                    'volume': float(kline['volume']),
+                    'turnover': float(kline.get('turnover', 0)),
+                    'symbol': symbol,
+                    'timeframe': self.interval,
+                    'is_closed': kline.get('confirm', False)  # True when candle closes
+                }
+                
+                # Update buffer
+                self.candle_buffer[symbol] = candle
+                
+                # Only log closed candles (open candle updates are too frequent and noisy)
+                # Call callback if candle is closed
+                if candle['is_closed'] and self.callback:
+                    logger.info(f"Closed candle for {symbol}: {candle['close']:.2f} @ {candle['timestamp']}")
+                    df = pd.DataFrame([candle])
+                    self.callback(df)
+                # Open candle updates are not logged to reduce log spam
+                # They're still stored in buffer for real-time price tracking
         
+        except KeyError as e:
+            # Log more details about the message structure for debugging
+            logger.error(
+                f"KeyError handling WebSocket message: {e}. "
+                f"Topic: {message.get('topic', 'N/A')}, "
+                f"Data type: {type(message.get('data'))}, "
+                f"Data keys: {list(message.get('data', [{}])[0].keys()) if message.get('data') and isinstance(message.get('data'), list) and len(message.get('data')) > 0 else 'N/A'}"
+            )
         except Exception as e:
-            logger.error(f"Error handling WebSocket message: {e}")
+            logger.error(
+                f"Error handling WebSocket message: {e}. "
+                f"Message type: {type(message)}, "
+                f"Message keys: {list(message.keys()) if isinstance(message, dict) else 'N/A'}"
+            )
     
     def start(self):
         """Start WebSocket connection and subscribe to streams"""
@@ -93,18 +122,12 @@ class LiveDataStream:
             )
             
             # Subscribe to kline streams
-            topics = [f"kline.{self.interval}.{symbol}" for symbol in self.symbols]
-            
-            self.ws.kline_stream(
-                callback=self._handle_message,
-                symbol=self.symbols[0] if len(self.symbols) == 1 else None
-            )
-            
-            # Subscribe to additional symbols if needed
-            for symbol in self.symbols[1:]:
+            # For pybit WebSocket, we need to subscribe to each symbol with interval
+            for symbol in self.symbols:
                 self.ws.kline_stream(
                     callback=self._handle_message,
-                    symbol=symbol
+                    symbol=symbol,
+                    interval=self.interval  # Required parameter
                 )
             
             self.running = True

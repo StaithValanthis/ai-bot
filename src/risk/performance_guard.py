@@ -92,7 +92,8 @@ class PerformanceGuard:
                 'win_rate': 0.0,
                 'total_pnl': 0.0,
                 'losing_streak': 0,
-                'drawdown': 0.0
+                'drawdown': 0.0,
+                'num_trades': 0
             }
         
         # Last N trades
@@ -103,7 +104,8 @@ class PerformanceGuard:
                 'win_rate': 0.0,
                 'total_pnl': 0.0,
                 'losing_streak': 0,
-                'drawdown': 0.0
+                'drawdown': 0.0,
+                'num_trades': 0
             }
         
         wins = sum(1 for t in recent if t['is_win'])

@@ -75,10 +75,19 @@ class BybitClient:
             List of position dictionaries
         """
         try:
-            response = self.session.get_positions(
-                category="linear",
-                symbol=symbol
-            )
+            # Bybit API requires settleCoin for linear perpetuals
+            # Pass parameters directly as keyword arguments
+            if symbol:
+                response = self.session.get_positions(
+                    category="linear",
+                    symbol=symbol,
+                    settleCoin="USDT"
+                )
+            else:
+                response = self.session.get_positions(
+                    category="linear",
+                    settleCoin="USDT"
+                )
             
             if response['retCode'] != 0:
                 logger.error(f"Error getting positions: {response.get('retMsg', 'Unknown error')}")
@@ -208,6 +217,51 @@ class BybitClient:
             logger.error(f"Exception canceling order: {e}")
             return False
     
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
+        """
+        Get open orders (including conditional stop-loss/take-profit orders).
+        
+        Args:
+            symbol: Optional symbol filter
+            
+        Returns:
+            List of open order dictionaries
+        """
+        try:
+            params = {
+                'category': 'linear',
+                'settleCoin': 'USDT'
+            }
+            if symbol:
+                params['symbol'] = symbol
+            
+            response = self.session.get_open_orders(**params)
+            
+            if response['retCode'] != 0:
+                logger.error(f"Error getting open orders: {response.get('retMsg', 'Unknown error')}")
+                return []
+            
+            orders = []
+            for order in response['result'].get('list', []):
+                orders.append({
+                    'order_id': order.get('orderId', ''),
+                    'symbol': order.get('symbol', ''),
+                    'side': order.get('side', ''),
+                    'order_type': order.get('orderType', ''),
+                    'qty': float(order.get('qty', 0)),
+                    'price': float(order.get('price', 0)) if order.get('price') else None,
+                    'stop_loss': float(order.get('stopLoss', 0)) if order.get('stopLoss') else None,
+                    'take_profit': float(order.get('takeProfit', 0)) if order.get('takeProfit') else None,
+                    'trigger_price': float(order.get('triggerPrice', 0)) if order.get('triggerPrice') else None,
+                    'order_status': order.get('orderStatus', '')
+                })
+            
+            return orders
+        
+        except Exception as e:
+            logger.error(f"Exception getting open orders: {e}")
+            return []
+    
     def set_leverage(
         self,
         symbol: str,
@@ -232,13 +286,16 @@ class BybitClient:
             )
             
             if response['retCode'] != 0:
-                logger.error(f"Error setting leverage: {response.get('retMsg', 'Unknown error')}")
+                error_msg = response.get('retMsg', 'Unknown error')
+                # Log as debug to reduce noise (permission errors are common)
+                logger.debug(f"Could not set leverage for {symbol}: {error_msg}")
                 return False
             
-            logger.info(f"Set leverage to {leverage}x for {symbol}")
+            logger.debug(f"Set leverage to {leverage}x for {symbol}")
             return True
         
         except Exception as e:
-            logger.error(f"Exception setting leverage: {e}")
+            # Log as debug to reduce noise
+            logger.debug(f"Exception setting leverage for {symbol}: {e}")
             return False
 

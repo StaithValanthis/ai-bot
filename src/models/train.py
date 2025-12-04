@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, roc_auc_score, precision_recall_fscore_support
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
+import time
 
 from src.signals.features import FeatureCalculator
 from src.signals.primary_signal import PrimarySignalGenerator
@@ -394,6 +395,7 @@ class ModelTrainer:
         X_test_scaled = scaler.transform(X_test)
         
         # Train XGBoost model
+        # Note: In XGBoost 2.0+, early_stopping_rounds must be in constructor, not fit()
         xgb_model = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=5,
@@ -401,14 +403,14 @@ class ModelTrainer:
             subsample=0.8,
             colsample_bytree=0.8,
             random_state=42,
-            eval_metric='logloss'
+            eval_metric='logloss',
+            early_stopping_rounds=10  # XGBoost 2.0+ requires this in constructor
         )
         
         xgb_model.fit(
             X_train_scaled,
             y_train,
             eval_set=[(X_val_scaled, y_val)],
-            early_stopping_rounds=10,  # Must be passed to fit() to function properly
             verbose=False
         )
         
@@ -500,7 +502,10 @@ class ModelTrainer:
             features_df: Feature DataFrame (for feature names)
             version: Model version
         """
-        model_dir = Path("models")
+        # Use absolute path based on project root (where train.py is located)
+        # This ensures models are saved to the correct location regardless of CWD
+        project_root = Path(__file__).parent.parent.parent
+        model_dir = project_root / "models"
         model_dir.mkdir(exist_ok=True)
         
         # Save model
@@ -513,42 +518,130 @@ class ModelTrainer:
         joblib.dump(scaler, scaler_path)
         logger.info(f"Saved scaler to {scaler_path}")
         
+        # Load existing config to merge metadata (if it exists)
+        # Use file locking to prevent race conditions when multiple threads save simultaneously
+        existing_config = {}
+        config_path = model_dir / f"model_config_v{version}.json"
+        
+        # Try to acquire lock and read existing config
+        # Use a lock file approach for cross-platform compatibility
+        lock_path = model_dir / f".model_config_v{version}.lock"
+        max_lock_attempts = 30
+        lock_acquired = False
+        lock_file = None
+        
+        for attempt in range(max_lock_attempts):
+            try:
+                # Try to create lock file atomically
+                try:
+                    lock_file = open(str(lock_path), 'x')  # 'x' mode = exclusive creation, fails if exists
+                    lock_acquired = True
+                    break
+                except FileExistsError:
+                    # Lock file exists, another process is writing
+                    if attempt < max_lock_attempts - 1:
+                        time.sleep(0.1 * min(attempt + 1, 5))  # Exponential backoff, max 0.5s
+                        continue
+                    else:
+                        logger.warning(f"Could not acquire lock after {max_lock_attempts} attempts, proceeding without merge (may cause race condition)")
+                        break
+            except Exception as e:
+                logger.warning(f"Error acquiring lock (attempt {attempt + 1}): {e}")
+                if attempt < max_lock_attempts - 1:
+                    time.sleep(0.1 * min(attempt + 1, 5))
+                    continue
+                else:
+                    break
+        
+        # Read existing config if lock acquired or if no lock needed
+        if lock_acquired or not lock_path.exists():
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r') as f:
+                        existing_config = json.load(f)
+                    logger.debug(f"Loaded existing model config for merging: {len(existing_config.get('trained_symbols', []))} symbols")
+                except Exception as e:
+                    logger.warning(f"Could not read existing config: {e}")
+        
         # Save config with model coverage metadata
+        # Use datetime.now() instead of datetime.utcnow() (utcnow is deprecated in Python 3.12+)
+        from datetime import timezone as tz
         config = {
             'version': version,
-            'training_date': datetime.utcnow().isoformat(),
+            'training_date': datetime.now(tz.utc).isoformat(),
             'features': list(features_df.columns),
             'performance': metrics,
             'training_mode': self.training_mode,
             'symbol_encoding_type': self.symbol_encoding_type
         }
         
-        # Add model coverage metadata
+        # Merge trained_symbols: add new symbols to existing list (don't overwrite)
+        existing_trained_symbols = set(existing_config.get('trained_symbols', []))
         if hasattr(self, 'trained_symbols') and self.trained_symbols:
-            config['trained_symbols'] = self.trained_symbols
-            logger.info(f"Saved trained_symbols: {self.trained_symbols}")
+            new_symbols = set(self.trained_symbols) if isinstance(self.trained_symbols, list) else {self.trained_symbols}
+            merged_symbols = sorted(list(existing_trained_symbols | new_symbols))
+            config['trained_symbols'] = merged_symbols
+            if new_symbols - existing_trained_symbols:
+                logger.info(f"Added {len(new_symbols - existing_trained_symbols)} new symbol(s) to trained_symbols: {sorted(new_symbols - existing_trained_symbols)}")
+                logger.info(f"Total trained_symbols: {len(merged_symbols)} symbols")
+            else:
+                logger.info(f"trained_symbols unchanged: {len(merged_symbols)} symbols")
         
+        # Merge training_days: use maximum (most recent training)
         if hasattr(self, 'training_days') and self.training_days:
-            config['training_days'] = self.training_days
+            existing_days = existing_config.get('training_days', 0)
+            config['training_days'] = max(self.training_days, existing_days)
         
+        # Merge training_end_timestamp: use most recent
         if hasattr(self, 'training_end_timestamp') and self.training_end_timestamp:
-            config['training_end_timestamp'] = self.training_end_timestamp.isoformat() if hasattr(self.training_end_timestamp, 'isoformat') else str(self.training_end_timestamp)
+            new_timestamp = self.training_end_timestamp.isoformat() if hasattr(self.training_end_timestamp, 'isoformat') else str(self.training_end_timestamp)
+            existing_timestamp = existing_config.get('training_end_timestamp')
+            if existing_timestamp:
+                # Compare timestamps and use most recent
+                try:
+                    # Use datetime from module-level import (already imported at top)
+                    new_dt = datetime.fromisoformat(new_timestamp.replace('Z', '+00:00'))
+                    existing_dt = datetime.fromisoformat(existing_timestamp.replace('Z', '+00:00'))
+                    config['training_end_timestamp'] = new_timestamp if new_dt > existing_dt else existing_timestamp
+                except:
+                    config['training_end_timestamp'] = new_timestamp
+            else:
+                config['training_end_timestamp'] = new_timestamp
         
+        # Merge min_history_days_per_symbol: use minimum (most conservative)
         if hasattr(self, 'min_history_days_per_symbol') and self.min_history_days_per_symbol:
-            config['min_history_days_per_symbol'] = self.min_history_days_per_symbol
+            existing_min = existing_config.get('min_history_days_per_symbol', 999999)
+            config['min_history_days_per_symbol'] = min(self.min_history_days_per_symbol, existing_min)
         
-        # Add per-symbol history days if available (for multi-symbol models)
+        # Merge per-symbol history days: combine dictionaries
         if hasattr(self, 'symbol_history_days') and self.symbol_history_days:
-            config['symbol_history_days'] = self.symbol_history_days
-            logger.info(f"Saved per-symbol history days: {self.symbol_history_days}")
+            existing_symbol_history = existing_config.get('symbol_history_days', {})
+            merged_history = {**existing_symbol_history, **self.symbol_history_days}
+            config['symbol_history_days'] = merged_history
+            logger.info(f"Updated per-symbol history days: {len(merged_history)} symbols")
         
-        # Add symbol encoding map if multi-symbol training
+        # Merge symbol encoding map: combine dictionaries (for multi-symbol models)
         if hasattr(self, 'symbol_encoding_map') and self.symbol_encoding_map:
-            config['symbol_encoding_map'] = self.symbol_encoding_map
-            logger.info(f"Saved symbol encoding map for {len(self.symbol_encoding_map)} symbols")
+            existing_encoding_map = existing_config.get('symbol_encoding_map', {})
+            merged_encoding_map = {**existing_encoding_map, **self.symbol_encoding_map}
+            config['symbol_encoding_map'] = merged_encoding_map
+            logger.info(f"Updated symbol encoding map: {len(merged_encoding_map)} symbols")
         
-        config_path = model_dir / f"model_config_v{version}.json"
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-        logger.info(f"Saved config to {config_path}")
+        # Write config (we hold the lock if acquired)
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            logger.info(f"Saved config to {config_path}")
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+            raise
+        finally:
+            # Always release lock
+            if lock_acquired and lock_file:
+                try:
+                    lock_file.close()
+                    if lock_path.exists():
+                        lock_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Could not release lock file: {e}")
 

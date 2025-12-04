@@ -10,9 +10,10 @@ import argparse
 import sys
 import time
 import signal
+import threading
+import subprocess
 from pathlib import Path
 import json
-from datetime import datetime
 from datetime import datetime
 from typing import Optional
 from loguru import logger
@@ -76,6 +77,13 @@ class TradingBot:
             config_path=str(model_paths['config'])
         )
         
+        # Log model coverage on startup
+        trained_count = len(self.meta_predictor.trained_symbols)
+        if trained_count > 0:
+            logger.info(f"Model covers {trained_count} trained symbol(s): {sorted(self.meta_predictor.trained_symbols)[:10]}{'...' if trained_count > 10 else ''}")
+        else:
+            logger.warning("Model has no trained_symbols metadata - this may be an older model or training hasn't completed yet")
+        
         # Initialize Bybit client
         exchange_config = self.config['exchange']
         self.bybit_client = BybitClient(
@@ -84,11 +92,27 @@ class TradingBot:
             testnet=exchange_config.get('testnet', True)
         )
         
-        # Set leverage for all trading symbols
+        # Set leverage for all trading symbols (non-blocking)
+        # Note: This may fail if API key doesn't have leverage-setting permissions
+        # The bot will continue to operate - leverage may already be set on account
         leverage = int(self.config['risk']['max_leverage'])
+        leverage_set_count = 0
+        leverage_failed_count = 0
+        
         for symbol in self.trading_symbols:
-            self.bybit_client.set_leverage(symbol, leverage)
-            logger.debug(f"Set leverage {leverage}x for {symbol}")
+            if self.bybit_client.set_leverage(symbol, leverage):
+                leverage_set_count += 1
+            else:
+                leverage_failed_count += 1
+        
+        if leverage_set_count > 0:
+            logger.info(f"Set leverage {leverage}x for {leverage_set_count} symbol(s)")
+        if leverage_failed_count > 0:
+            logger.warning(
+                f"Could not set leverage for {leverage_failed_count} symbol(s). "
+                f"This may be due to API key permissions. "
+                f"Bot will continue - ensure leverage is set manually on Bybit if needed."
+            )
         
         # Data storage
         self.candle_data = {}  # Store candles per symbol
@@ -99,6 +123,8 @@ class TradingBot:
         self.blocked_symbols = set()  # Symbols blocked from trading (untrained)
         self.training_queue_path = Path("data/new_symbol_training_queue.json")
         self.training_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.training_threads = {}  # Track background training threads
+        self.training_lock = threading.Lock()  # Lock for thread-safe operations
         
         # Check model coverage and block untrained symbols
         self._check_model_coverage()
@@ -129,6 +155,98 @@ class TradingBot:
             )
         
         return df
+    
+    def _load_existing_positions(self):
+        """
+        Load existing positions from Bybit and populate self.positions.
+        Called on startup to re-attach to positions opened before restart.
+        
+        This method:
+        - Fetches all open positions from Bybit
+        - Attempts to retrieve stop-loss/take-profit from exchange orders
+        - Falls back to config defaults if orders not found
+        - Populates self.positions for monitoring
+        """
+        try:
+            logger.info("Loading existing positions from Bybit...")
+            open_positions = self.bybit_client.get_positions()
+            
+            if not open_positions:
+                logger.info("No existing positions found")
+                return
+            
+            logger.info(f"Found {len(open_positions)} existing position(s)")
+            
+            # Get all open orders to check for stop-loss/take-profit
+            open_orders = self.bybit_client.get_open_orders()
+            orders_by_symbol = {}
+            for order in open_orders:
+                symbol = order['symbol']
+                if symbol not in orders_by_symbol:
+                    orders_by_symbol[symbol] = []
+                orders_by_symbol[symbol].append(order)
+            
+            for pos in open_positions:
+                symbol = pos['symbol']
+                entry_price = pos['entry_price']  # From exchange
+                side = pos['side']
+                qty = pos['size']
+                
+                # Try to get stop-loss/take-profit from exchange orders
+                stop_loss = None
+                take_profit = None
+                
+                if symbol in orders_by_symbol:
+                    for order in orders_by_symbol[symbol]:
+                        # Check for conditional stop-loss/take-profit orders
+                        if order.get('stop_loss'):
+                            stop_loss = order['stop_loss']
+                        if order.get('take_profit'):
+                            take_profit = order['take_profit']
+                
+                # Fallback to config defaults if not found in orders
+                if stop_loss is None or take_profit is None:
+                    stop_loss_pct = self.config['risk']['stop_loss_pct']
+                    take_profit_pct = self.config['risk']['take_profit_pct']
+                    
+                    if side == 'Buy':  # Long position
+                        if stop_loss is None:
+                            stop_loss = entry_price * (1 - stop_loss_pct)
+                        if take_profit is None:
+                            take_profit = entry_price * (1 + take_profit_pct)
+                    else:  # Short position
+                        if stop_loss is None:
+                            stop_loss = entry_price * (1 + stop_loss_pct)
+                        if take_profit is None:
+                            take_profit = entry_price * (1 - take_profit_pct)
+                    
+                    logger.warning(
+                        f"Position {symbol}: Stop-loss/take-profit not found in exchange orders, "
+                        f"using config defaults (SL: {stop_loss:.2f}, TP: {take_profit:.2f})"
+                    )
+                
+                # Populate self.positions
+                self.positions[symbol] = {
+                    'entry_price': entry_price,
+                    'side': side,
+                    'qty': qty,
+                    'entry_time': None,  # Lost on restart, but not critical for monitoring
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'loaded_from_exchange': True  # Flag to indicate re-attached position
+                }
+                
+                logger.info(
+                    f"Re-attached to position: {symbol} {side} {qty:.6f} @ {entry_price:.2f} "
+                    f"(SL: {stop_loss:.2f}, TP: {take_profit:.2f})"
+                )
+            
+            logger.info(f"Successfully loaded {len(self.positions)} position(s) for monitoring")
+        
+        except Exception as e:
+            logger.error(f"Error loading existing positions: {e}", exc_info=True)
+            # Don't fail startup, but log error clearly
+            logger.warning("Bot will continue, but existing positions may not be monitored until manually managed")
     
     def _check_model_coverage(self):
         """Check model coverage and block untrained symbols, including history requirements"""
@@ -219,43 +337,390 @@ class TradingBot:
             if symbols_to_queue:
                 logger.info(f"  - {len(symbols_to_queue)} eligible for training: {sorted(symbols_to_queue)}")
             
-            # Queue eligible symbols for training
+            # Train eligible symbols immediately in background (if auto_train enabled)
             if auto_train and symbols_to_queue:
-                self._queue_symbols_for_training(symbols_to_queue)
+                logger.info(f"Starting background training for {len(symbols_to_queue)} symbol(s)...")
+                self._train_symbols_in_background(symbols_to_queue)
             elif not auto_train:
                 logger.warning("Auto-training is disabled. Untrained symbols will remain blocked.")
         else:
             logger.info(f"All {len(universe_symbols)} universe symbols are covered by model")
     
-    def _queue_symbols_for_training(self, symbols: set):
-        """Add symbols to training queue"""
+    def _check_and_unblock_symbols(self):
+        """
+        Check if any blocked symbols have been trained and unblock them.
+        Called after universe refresh to unblock symbols that were trained since last check.
+        """
+        if not self.blocked_symbols:
+            return
         
-        # Load existing queue
-        queue_data = {"queued_symbols": [], "queued_at": {}}
-        if self.training_queue_path.exists():
-            try:
-                with open(self.training_queue_path, 'r') as f:
-                    queue_data = json.load(f)
-            except Exception as e:
-                logger.warning(f"Could not load training queue: {e}")
+        # Get current trained symbols from model
+        trained_symbols = set(self.meta_predictor.trained_symbols)
         
-        # Add new symbols to queue
-        added_count = 0
+        # Find symbols that are blocked but now trained
+        symbols_to_unblock = []
+        for symbol in list(self.blocked_symbols):
+            if symbol in trained_symbols:
+                symbols_to_unblock.append(symbol)
+                self.blocked_symbols.remove(symbol)
+                logger.info(f"Unblocked {symbol}: Now covered by model")
+        
+        if symbols_to_unblock:
+            logger.info(f"Unblocked {len(symbols_to_unblock)} symbol(s): {sorted(symbols_to_unblock)}")
+        else:
+            logger.debug("No symbols to unblock (all blocked symbols still untrained)")
+    
+    def _train_symbols_in_background(self, symbols: set):
+        """
+        Train symbols in background threads without blocking the main loop.
+        
+        Args:
+            symbols: Set of symbols to train
+        """
         for symbol in symbols:
-            if symbol not in queue_data["queued_symbols"]:
-                queue_data["queued_symbols"].append(symbol)
-                queue_data["queued_at"][symbol] = datetime.utcnow().isoformat()
-                added_count += 1
-                logger.info(f"Queued {symbol} for training")
+            # Check if already training this symbol
+            with self.training_lock:
+                if symbol in self.training_threads:
+                    thread = self.training_threads[symbol]
+                    if thread.is_alive():
+                        logger.debug(f"Symbol {symbol} is already being trained, skipping")
+                        continue
+            
+            # Start background training thread
+            thread = threading.Thread(
+                target=self._train_symbol_worker,
+                args=(symbol,),
+                daemon=True,
+                name=f"Train-{symbol}"
+            )
+            thread.start()
+            
+            with self.training_lock:
+                self.training_threads[symbol] = thread
+            
+            logger.info(f"Started background training thread for {symbol}")
+    
+    def _train_symbol_worker(self, symbol: str):
+        """
+        Worker function to train a single symbol in the background.
+        This runs in a separate thread and doesn't block the main trading loop.
         
-        # Save queue
+        Args:
+            symbol: Symbol to train
+        """
         try:
-            with open(self.training_queue_path, 'w') as f:
-                json.dump(queue_data, f, indent=2)
-            if added_count > 0:
-                logger.info(f"Added {added_count} symbol(s) to training queue: {self.training_queue_path}")
+            logger.info(f"[{symbol}] Starting background training...")
+            
+            # Get training settings
+            model_config = self.config.get('model', {})
+            target_history_days = model_config.get('target_history_days', 730)
+            min_history_days = model_config.get('min_history_days_to_train', 90)
+            min_coverage_pct = model_config.get('min_history_coverage_pct', 0.95)
+            
+            # Initialize data collector
+            from src.data.historical_data import HistoricalDataCollector
+            data_collector = HistoricalDataCollector(
+                api_key=self.config['exchange'].get('api_key'),
+                api_secret=self.config['exchange'].get('api_secret'),
+                testnet=self.config['exchange'].get('testnet', True)
+            )
+            
+            # Download or load historical data
+            logger.info(f"[{symbol}] Downloading/loading up to {target_history_days} days of data...")
+            df = data_collector.download_and_save(
+                symbol=symbol,
+                days=target_history_days,
+                interval="60",
+                data_path=self.config['data']['historical_data_path']
+            )
+            
+            if df.empty:
+                logger.error(f"[{symbol}] No data available, cannot train")
+                return
+            
+            # Verify history requirements
+            history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
+            available_days = history_metrics['available_days']
+            coverage_pct = history_metrics['coverage_pct']
+            
+            if available_days < min_history_days:
+                logger.warning(f"[{symbol}] Only {available_days:.1f} days available (< {min_history_days} minimum). Skipping training.")
+                return
+            
+            if coverage_pct < min_coverage_pct:
+                logger.warning(f"[{symbol}] {coverage_pct*100:.1f}% coverage (< {min_coverage_pct*100:.1f}% required). Skipping training.")
+                return
+            
+            # Use most recent target_history_days if more available
+            if available_days > target_history_days:
+                df = df.sort_values('timestamp').tail(int(target_history_days * 24)).reset_index(drop=True)
+                logger.info(f"[{symbol}] Using most recent {target_history_days} days")
+            
+            # Run training via subprocess to avoid blocking and ensure clean state
+            logger.info(f"[{symbol}] Starting model training...")
+            cmd = [
+                sys.executable,
+                'train_model.py',
+                '--symbol', symbol,
+                '--days', str(target_history_days),
+                '--config', 'config/config.yaml'
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 hour timeout per symbol
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"[{symbol}] ✓ Training completed successfully")
+                
+                # Reload model to pick up new training
+                try:
+                    from src.config.config_loader import get_model_paths
+                    model_paths = get_model_paths(self.config)
+                    self.meta_predictor = MetaPredictor(
+                        model_path=str(model_paths['model']),
+                        scaler_path=str(model_paths['scaler']),
+                        config_path=str(model_paths['config'])
+                    )
+                    logger.info(f"[{symbol}] Model reloaded, symbol should now be unblocked")
+                    
+                    # Unblock symbol if it's now trained
+                    if symbol in self.meta_predictor.trained_symbols:
+                        with self.training_lock:
+                            if symbol in self.blocked_symbols:
+                                self.blocked_symbols.remove(symbol)
+                                logger.info(f"[{symbol}] Symbol unblocked and ready for trading")
+                except Exception as e:
+                    logger.error(f"[{symbol}] Error reloading model: {e}")
+            else:
+                logger.error(f"[{symbol}] ✗ Training failed (exit code: {result.returncode})")
+                # Log full error output (not truncated)
+                if result.stderr:
+                    stderr_lines = result.stderr.strip().split('\n')
+                    if len(stderr_lines) > 50:
+                        logger.error(f"[{symbol}] Error output (showing last 50 of {len(stderr_lines)} lines):")
+                        for line in stderr_lines[-50:]:
+                            logger.error(f"[{symbol}]   {line}")
+                    else:
+                        logger.error(f"[{symbol}] Error output:")
+                        for line in stderr_lines:
+                            logger.error(f"[{symbol}]   {line}")
+                # Also check stdout for error messages
+                if result.stdout:
+                    stdout_lines = result.stdout.strip().split('\n')
+                    # Look for error patterns in stdout
+                    error_lines = [line for line in stdout_lines if any(keyword in line.upper() for keyword in ['ERROR', 'EXCEPTION', 'TRACEBACK', 'FAILED'])]
+                    if error_lines:
+                        logger.error(f"[{symbol}] Error messages in stdout:")
+                        for line in error_lines[-20:]:  # Last 20 error lines
+                            logger.error(f"[{symbol}]   {line}")
+        
+        except subprocess.TimeoutExpired:
+            logger.error(f"[{symbol}] Training timed out after 1 hour")
         except Exception as e:
-            logger.error(f"Could not save training queue: {e}")
+            logger.error(f"[{symbol}] Error in training worker: {e}", exc_info=True)
+        finally:
+            # Clean up thread tracking
+            with self.training_lock:
+                if symbol in self.training_threads:
+                    del self.training_threads[symbol]
+    
+    def _queue_symbols_for_training(self, symbols: set):
+        """
+        Legacy method: Add symbols to training queue (for backward compatibility).
+        Now redirects to background training if auto_train is enabled.
+        """
+        model_config = self.config.get('model', {})
+        auto_train = model_config.get('auto_train_new_symbols', True)
+        
+        if auto_train:
+            # Use new background training instead
+            self._train_symbols_in_background(symbols)
+        else:
+            # Fallback to queue if auto_train disabled
+            queue_data = {"queued_symbols": [], "queued_at": {}}
+            if self.training_queue_path.exists():
+                try:
+                    with open(self.training_queue_path, 'r') as f:
+                        queue_data = json.load(f)
+                except Exception as e:
+                    logger.warning(f"Could not load training queue: {e}")
+            
+            added_count = 0
+            for symbol in symbols:
+                if symbol not in queue_data["queued_symbols"]:
+                    queue_data["queued_symbols"].append(symbol)
+                    queue_data["queued_at"][symbol] = datetime.utcnow().isoformat()
+                    added_count += 1
+            
+            try:
+                with open(self.training_queue_path, 'w') as f:
+                    json.dump(queue_data, f, indent=2)
+                if added_count > 0:
+                    logger.info(f"Added {added_count} symbol(s) to training queue (auto_train disabled)")
+            except Exception as e:
+                logger.error(f"Could not save training queue: {e}")
+    
+    def _train_symbols_in_background(self, symbols: set):
+        """
+        Train symbols in background threads without blocking the main loop.
+        
+        Args:
+            symbols: Set of symbols to train
+        """
+        for symbol in symbols:
+            # Check if already training this symbol
+            with self.training_lock:
+                if symbol in self.training_threads:
+                    thread = self.training_threads[symbol]
+                    if thread.is_alive():
+                        logger.debug(f"Symbol {symbol} is already being trained, skipping")
+                        continue
+            
+            # Start background training thread
+            thread = threading.Thread(
+                target=self._train_symbol_worker,
+                args=(symbol,),
+                daemon=True,
+                name=f"Train-{symbol}"
+            )
+            thread.start()
+            
+            with self.training_lock:
+                self.training_threads[symbol] = thread
+            
+            logger.info(f"Started background training thread for {symbol}")
+    
+    def _train_symbol_worker(self, symbol: str):
+        """
+        Worker function to train a single symbol in the background.
+        This runs in a separate thread and doesn't block the main trading loop.
+        
+        Args:
+            symbol: Symbol to train
+        """
+        try:
+            logger.info(f"[{symbol}] Starting background training...")
+            
+            # Get training settings
+            model_config = self.config.get('model', {})
+            target_history_days = model_config.get('target_history_days', 730)
+            min_history_days = model_config.get('min_history_days_to_train', 90)
+            min_coverage_pct = model_config.get('min_history_coverage_pct', 0.95)
+            
+            # Initialize data collector
+            from src.data.historical_data import HistoricalDataCollector
+            data_collector = HistoricalDataCollector(
+                api_key=self.config['exchange'].get('api_key'),
+                api_secret=self.config['exchange'].get('api_secret'),
+                testnet=self.config['exchange'].get('testnet', True)
+            )
+            
+            # Download or load historical data
+            logger.info(f"[{symbol}] Downloading/loading up to {target_history_days} days of data...")
+            df = data_collector.download_and_save(
+                symbol=symbol,
+                days=target_history_days,
+                interval="60",
+                data_path=self.config['data']['historical_data_path']
+            )
+            
+            if df.empty:
+                logger.error(f"[{symbol}] No data available, cannot train")
+                return
+            
+            # Verify history requirements
+            history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
+            available_days = history_metrics['available_days']
+            coverage_pct = history_metrics['coverage_pct']
+            
+            if available_days < min_history_days:
+                logger.warning(f"[{symbol}] Only {available_days:.1f} days available (< {min_history_days} minimum). Skipping training.")
+                return
+            
+            if coverage_pct < min_coverage_pct:
+                logger.warning(f"[{symbol}] {coverage_pct*100:.1f}% coverage (< {min_coverage_pct*100:.1f}% required). Skipping training.")
+                return
+            
+            # Use most recent target_history_days if more available
+            if available_days > target_history_days:
+                df = df.sort_values('timestamp').tail(int(target_history_days * 24)).reset_index(drop=True)
+                logger.info(f"[{symbol}] Using most recent {target_history_days} days")
+            
+            # Run training via subprocess to avoid blocking and ensure clean state
+            logger.info(f"[{symbol}] Starting model training...")
+            cmd = [
+                sys.executable,
+                'train_model.py',
+                '--symbol', symbol,
+                '--days', str(target_history_days),
+                '--config', 'config/config.yaml'
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 hour timeout per symbol
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"[{symbol}] ✓ Training completed successfully")
+                
+                # Reload model to pick up new training
+                try:
+                    from src.config.config_loader import get_model_paths
+                    model_paths = get_model_paths(self.config)
+                    self.meta_predictor = MetaPredictor(
+                        model_path=str(model_paths['model']),
+                        scaler_path=str(model_paths['scaler']),
+                        config_path=str(model_paths['config'])
+                    )
+                    logger.info(f"[{symbol}] Model reloaded, symbol should now be unblocked")
+                    
+                    # Unblock symbol if it's now trained
+                    if symbol in self.meta_predictor.trained_symbols:
+                        with self.training_lock:
+                            if symbol in self.blocked_symbols:
+                                self.blocked_symbols.remove(symbol)
+                                logger.info(f"[{symbol}] Symbol unblocked and ready for trading")
+                except Exception as e:
+                    logger.error(f"[{symbol}] Error reloading model: {e}")
+            else:
+                logger.error(f"[{symbol}] ✗ Training failed (exit code: {result.returncode})")
+                # Log full error output (not truncated)
+                if result.stderr:
+                    stderr_lines = result.stderr.strip().split('\n')
+                    if len(stderr_lines) > 50:
+                        logger.error(f"[{symbol}] Error output (showing last 50 of {len(stderr_lines)} lines):")
+                        for line in stderr_lines[-50:]:
+                            logger.error(f"[{symbol}]   {line}")
+                    else:
+                        logger.error(f"[{symbol}] Error output:")
+                        for line in stderr_lines:
+                            logger.error(f"[{symbol}]   {line}")
+                # Also check stdout for error messages
+                if result.stdout:
+                    stdout_lines = result.stdout.strip().split('\n')
+                    # Look for error patterns in stdout
+                    error_lines = [line for line in stdout_lines if any(keyword in line.upper() for keyword in ['ERROR', 'EXCEPTION', 'TRACEBACK', 'FAILED'])]
+                    if error_lines:
+                        logger.error(f"[{symbol}] Error messages in stdout:")
+                        for line in error_lines[-20:]:  # Last 20 error lines
+                            logger.error(f"[{symbol}]   {line}")
+        
+        except subprocess.TimeoutExpired:
+            logger.error(f"[{symbol}] Training timed out after 1 hour")
+        except Exception as e:
+            logger.error(f"[{symbol}] Error in training worker: {e}", exc_info=True)
+        finally:
+            # Clean up thread tracking
+            with self.training_lock:
+                if symbol in self.training_threads:
+                    del self.training_threads[symbol]
     
     def _on_new_candle(self, df: pd.DataFrame):
         """Handle new candle from WebSocket"""
@@ -549,16 +1014,28 @@ class TradingBot:
             self.trade_logger.log_error("TRADE_EXECUTION", str(e))
     
     def _monitor_positions(self):
-        """Monitor open positions and check exit conditions"""
+        """
+        Monitor open positions and check exit conditions.
+        Also reconciles with exchange state to handle positions closed externally.
+        """
         try:
             open_positions = self.bybit_client.get_positions()
+            exchange_positions_dict = {pos['symbol']: pos for pos in open_positions}
             
-            for pos in open_positions:
-                symbol = pos['symbol']
-                mark_price = pos['mark_price']
-                
-                if symbol in self.positions:
-                    tracked = self.positions[symbol]
+            # Monitor tracked positions
+            for symbol, tracked in list(self.positions.items()):
+                if symbol in exchange_positions_dict:
+                    pos = exchange_positions_dict[symbol]
+                    mark_price = pos['mark_price']
+                    
+                    # Verify position side matches (sanity check)
+                    if pos['side'] != tracked['side']:
+                        logger.warning(
+                            f"Position {symbol} side mismatch: tracked={tracked['side']}, "
+                            f"exchange={pos['side']}. Re-syncing..."
+                        )
+                        # Update tracked side to match exchange
+                        tracked['side'] = pos['side']
                     
                     # Check stop loss / take profit
                     if pos['side'] == 'Buy':  # Long position
@@ -571,9 +1048,53 @@ class TradingBot:
                             self._close_position(symbol, "STOP_LOSS")
                         elif mark_price <= tracked['take_profit']:
                             self._close_position(symbol, "TAKE_PROFIT")
+                else:
+                    # Position closed externally (not by bot)
+                    logger.warning(
+                        f"Position {symbol} closed externally (not in exchange positions), "
+                        f"removing from tracking"
+                    )
+                    del self.positions[symbol]
+            
+            # Detect positions on exchange not in self.positions (shouldn't happen after fix, but handle it)
+            for symbol, pos in exchange_positions_dict.items():
+                if symbol not in self.positions:
+                    logger.warning(
+                        f"Found untracked position {symbol} on exchange - this should not happen. "
+                        f"Attempting to load it now..."
+                    )
+                    # Try to load it (one-time sync)
+                    try:
+                        entry_price = pos['entry_price']
+                        side = pos['side']
+                        qty = pos['size']
+                        
+                        # Use config defaults for stop-loss/take-profit
+                        stop_loss_pct = self.config['risk']['stop_loss_pct']
+                        take_profit_pct = self.config['risk']['take_profit_pct']
+                        
+                        if side == 'Buy':  # Long
+                            stop_loss = entry_price * (1 - stop_loss_pct)
+                            take_profit = entry_price * (1 + take_profit_pct)
+                        else:  # Short
+                            stop_loss = entry_price * (1 + stop_loss_pct)
+                            take_profit = entry_price * (1 - take_profit_pct)
+                        
+                        self.positions[symbol] = {
+                            'entry_price': entry_price,
+                            'side': side,
+                            'qty': qty,
+                            'entry_time': None,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'loaded_from_exchange': True
+                        }
+                        logger.info(f"Loaded untracked position {symbol} for monitoring")
+                    except Exception as e:
+                        logger.error(f"Failed to load untracked position {symbol}: {e}")
         
         except Exception as e:
-            logger.error(f"Error monitoring positions: {e}")
+            logger.error(f"Error monitoring positions: {e}", exc_info=True)
     
     def _close_position(self, symbol: str, reason: str):
         """Close a position"""
@@ -639,6 +1160,9 @@ class TradingBot:
         logger.info("Starting trading bot")
         logger.info("=" * 60)
         
+        # Load existing positions from exchange (re-attach after restart)
+        self._load_existing_positions()
+        
         # Refresh universe if in auto mode (to get latest symbols)
         if self.config['exchange'].get('universe_mode') == 'auto':
             logger.info("Auto universe mode: refreshing symbol list...")
@@ -680,9 +1204,28 @@ class TradingBot:
             # Main loop
             health_check_interval = self.config.get('operations', {}).get('health_check_interval_seconds', 300)
             last_health_check = time.time()
+            last_heartbeat = time.time()
+            heartbeat_interval = 600  # Log heartbeat every 10 minutes
+            
+            logger.info(f"Main loop started. Health checks every {health_check_interval}s, heartbeat every {heartbeat_interval}s")
+            logger.info(f"Active symbols: {len(symbols) - len(self.blocked_symbols)} tradable, {len(self.blocked_symbols)} blocked")
             
             while self.running:
                 time.sleep(60)  # Check every minute
+                
+                # Periodic heartbeat (every 10 minutes)
+                current_time = time.time()
+                if (current_time - last_heartbeat) >= heartbeat_interval:
+                    last_heartbeat = current_time
+                    active_count = len(symbols) - len(self.blocked_symbols)
+                    blocked_count = len(self.blocked_symbols)
+                    positions_count = len(self.positions)
+                    candles_received = sum(1 for s in symbols if s in self.candle_data and len(self.candle_data[s]) > 0)
+                    
+                    logger.info(
+                        f"Bot heartbeat: {active_count} active symbols, {blocked_count} blocked, "
+                        f"{positions_count} open positions, {candles_received} symbols with data"
+                    )
                 
                 # Monitor positions
                 self._monitor_positions()
@@ -704,6 +1247,88 @@ class TradingBot:
                         )
                         self.stop()
                         break
+                
+                # Periodic check for completed training and re-evaluate blocked symbols (every 5 minutes)
+                # This allows symbols to be unblocked after background training completes
+                # Also re-checks symbols blocked due to insufficient history
+                if hasattr(self, 'training_threads') and self.training_threads:
+                    # Check for completed threads and unblock symbols
+                    completed_symbols = []
+                    with self.training_lock:
+                        for symbol, thread in list(self.training_threads.items()):
+                            if not thread.is_alive():
+                                completed_symbols.append(symbol)
+                    
+                    if completed_symbols:
+                        logger.info(f"Detected {len(completed_symbols)} completed training thread(s), checking for symbol unblocking...")
+                        # Reload model to ensure we have latest trained_symbols
+                        try:
+                            from src.config.config_loader import get_model_paths
+                            model_paths = get_model_paths(self.config)
+                            self.meta_predictor = MetaPredictor(
+                                model_path=str(model_paths['model']),
+                                scaler_path=str(model_paths['scaler']),
+                                config_path=str(model_paths['config'])
+                            )
+                            logger.debug("Model reloaded to check for newly trained symbols")
+                        except Exception as e:
+                            logger.warning(f"Could not reload model for unblocking check: {e}")
+                        
+                        # Check and unblock symbols
+                        self._check_and_unblock_symbols()
+                
+                # Periodic re-evaluation of blocked symbols (every 5 minutes)
+                # Check if symbols blocked due to insufficient history now have enough data
+                if hasattr(self, 'blocked_symbols') and self.blocked_symbols:
+                    model_config = self.config.get('model', {})
+                    auto_train = model_config.get('auto_train_new_symbols', True)
+                    block_short_history = model_config.get('block_short_history_symbols', True)
+                    min_history_days = model_config.get('min_history_days_to_train', 90)
+                    min_coverage_pct = model_config.get('min_history_coverage_pct', 0.95)
+                    
+                    if auto_train and block_short_history:
+                        # Re-check blocked symbols to see if they now have enough history
+                        symbols_to_retry = set()
+                        from src.data.historical_data import HistoricalDataCollector
+                        data_collector = HistoricalDataCollector(
+                            api_key=self.config['exchange'].get('api_key'),
+                            api_secret=self.config['exchange'].get('api_secret'),
+                            testnet=self.config['exchange'].get('testnet', True)
+                        )
+                        
+                        for symbol in list(self.blocked_symbols):
+                            # Skip if already training
+                            with self.training_lock:
+                                if symbol in self.training_threads and self.training_threads[symbol].is_alive():
+                                    continue
+                            
+                            # Check if symbol is now trained (might have been trained by another process)
+                            if symbol in self.meta_predictor.trained_symbols:
+                                self.blocked_symbols.remove(symbol)
+                                logger.info(f"Symbol {symbol} is now trained, unblocking")
+                                continue
+                            
+                            # Re-check history requirements
+                            df = data_collector.load_candles(
+                                symbol=symbol,
+                                timeframe="60",
+                                data_path=self.config['data']['historical_data_path']
+                            )
+                            
+                            if not df.empty:
+                                history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
+                                available_days = history_metrics['available_days']
+                                coverage_pct = history_metrics['coverage_pct']
+                                
+                                # If now meets requirements, queue for training
+                                if available_days >= min_history_days and coverage_pct >= min_coverage_pct:
+                                    logger.info(f"Symbol {symbol} now has sufficient history ({available_days:.1f} days, {coverage_pct*100:.1f}% coverage), queuing for training")
+                                    symbols_to_retry.add(symbol)
+                        
+                        # Train symbols that now meet requirements
+                        if symbols_to_retry:
+                            logger.info(f"Re-evaluated {len(symbols_to_retry)} blocked symbol(s), {len(symbols_to_retry)} now eligible for training")
+                            self._train_symbols_in_background(symbols_to_retry)
                 
                 # Periodic health check (every N seconds as configured)
                 current_time = time.time()
@@ -736,19 +1361,29 @@ class TradingBot:
                         model_info=model_info
                     )
                     
+                    # Log health check summary
+                    logger.info(
+                        f"Health check: status={health_status.get('health_status', 'UNKNOWN')}, "
+                        f"positions={len(positions_dict)}, "
+                        f"regime={regime_info.get('regime', 'UNKNOWN') if regime_info else 'N/A'}, "
+                        f"guard={guard_info.get('status', 'UNKNOWN') if guard_info else 'N/A'}"
+                    )
+                    
                     # Write status file
                     self.health_monitor.write_status_file(health_status)
                     
-                    # Alert on health issues
-                    if health_status['health_status'] == 'UNHEALTHY':
+                    # Alert on health issues (DEGRADED or UNHEALTHY)
+                    if health_status['health_status'] in ['DEGRADED', 'UNHEALTHY']:
+                        severity = "CRITICAL" if health_status['health_status'] == 'UNHEALTHY' else "WARNING"
                         self.alert_manager.notify_event(
                             event_type="HEALTH_ISSUE",
-                            message="Bot health degraded",
+                            message=f"Bot health {health_status['health_status'].lower()}",
                             context={
+                                'health_status': health_status['health_status'],
                                 'issues': health_status['issues'],
                                 'warnings': health_status['warnings']
                             },
-                            severity="WARNING"
+                            severity=severity
                         )
         
         except KeyboardInterrupt:

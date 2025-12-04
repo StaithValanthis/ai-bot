@@ -26,6 +26,7 @@ from src.models.train import ModelTrainer
 from src.models.evaluation import walk_forward_validation, aggregate_walk_forward_results, calculate_metrics
 from src.signals.features import FeatureCalculator
 from src.signals.primary_signal import PrimarySignalGenerator
+from datetime import datetime
 
 
 class ModelRotationManager:
@@ -359,11 +360,198 @@ class ModelRotationManager:
         return True
 
 
+def process_training_queue(config: dict, dry_run: bool = False) -> dict:
+    """
+    Process the new symbol training queue.
+    
+    Args:
+        config: Configuration dictionary
+        dry_run: If True, don't actually train, just report what would be done
+        
+    Returns:
+        Dictionary mapping symbols to training results
+    """
+    queue_path = Path("data/new_symbol_training_queue.json")
+    
+    if not queue_path.exists():
+        logger.info("No training queue found. No new symbols to train.")
+        return {}
+    
+    # Load queue
+    try:
+        with open(queue_path, 'r') as f:
+            queue = json.load(f)
+    except Exception as e:
+        logger.error(f"Could not load training queue: {e}")
+        return {}
+    
+    queued_symbols = queue.get('queued_symbols', [])
+    
+    if not queued_symbols:
+        logger.info("Training queue is empty. No new symbols to train.")
+        return {}
+    
+    logger.info("=" * 60)
+    logger.info(f"Processing Training Queue: {len(queued_symbols)} symbol(s)")
+    logger.info("=" * 60)
+    logger.info(f"Queued symbols: {queued_symbols}")
+    
+    if dry_run:
+        logger.info("DRY RUN: Would train these symbols")
+        return {s: "DRY_RUN" for s in queued_symbols}
+    
+    # Load training settings
+    target_history_days = config.get('model', {}).get('target_history_days', 730)
+    min_history_days = config.get('model', {}).get('min_history_days_to_train', 90)
+    min_coverage_pct = config.get('model', {}).get('min_history_coverage_pct', 0.95)
+    training_mode = config.get('model', {}).get('training_mode', 'single_symbol')
+    
+    # Initialize data collector
+    data_collector = HistoricalDataCollector(
+        api_key=config['exchange'].get('api_key'),
+        api_secret=config['exchange'].get('api_secret'),
+        testnet=config['exchange'].get('testnet', True)
+    )
+    
+    # Initialize trainer
+    trainer = ModelTrainer(config)
+    trainer.training_mode = training_mode
+    trainer.symbol_encoding_type = config.get('model', {}).get('symbol_encoding', 'one_hot')
+    
+    results = {}
+    successful_symbols = []
+    
+    for symbol in queued_symbols:
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Training new symbol: {symbol}")
+        logger.info(f"{'=' * 60}")
+        
+        try:
+            # Download historical data
+            logger.info(f"Downloading up to {target_history_days} days of data for {symbol}...")
+            df = data_collector.download_and_save(
+                symbol=symbol,
+                days=target_history_days,
+                interval="60",
+                data_path=config['data']['historical_data_path']
+            )
+            
+            if df.empty:
+                logger.warning(f"No data downloaded for {symbol}, skipping")
+                results[symbol] = "NO_DATA"
+                continue
+            
+            # Check history requirements
+            history_metrics = HistoricalDataCollector.calculate_history_metrics(df, expected_interval_minutes=60)
+            available_days = history_metrics['available_days']
+            coverage_pct = history_metrics['coverage_pct']
+            
+            logger.info(f"Data for {symbol}: {available_days:.1f} days available, {coverage_pct*100:.1f}% coverage")
+            
+            if available_days < min_history_days:
+                logger.warning(f"{symbol} has only {available_days:.1f} days (< {min_history_days} minimum). Skipping.")
+                results[symbol] = "INSUFFICIENT_HISTORY"
+                continue
+            
+            if coverage_pct < min_coverage_pct:
+                logger.warning(f"{symbol} has {coverage_pct*100:.1f}% coverage (< {min_coverage_pct*100:.1f}% minimum). Skipping.")
+                results[symbol] = "POOR_COVERAGE"
+                continue
+            
+            # Use most recent target_history_days if more available
+            if available_days > target_history_days:
+                df = df.sort_values('timestamp').tail(int(target_history_days * 24)).reset_index(drop=True)
+                logger.info(f"Using most recent {target_history_days} days for {symbol}")
+            
+            # Prepare training data
+            labeling_config = config.get('labeling', {})
+            execution_config = config.get('execution', {})
+            
+            logger.info("Preparing training data...")
+            features_df, labels = trainer.prepare_data(
+                df=df,
+                symbol=symbol,
+                hold_periods=4,
+                profit_threshold=0.005,
+                fee_rate=0.0005,
+                use_triple_barrier=labeling_config.get('use_triple_barrier', True),
+                profit_barrier=labeling_config.get('profit_barrier', 0.02),
+                loss_barrier=labeling_config.get('loss_barrier', 0.01),
+                time_barrier_hours=labeling_config.get('time_barrier_hours', 24),
+                base_slippage=execution_config.get('base_slippage', 0.0001),
+                include_funding=execution_config.get('include_funding', True),
+                funding_rate=execution_config.get('default_funding_rate', 0.0001)
+            )
+            
+            if features_df.empty:
+                logger.error(f"No training samples generated for {symbol}")
+                results[symbol] = "NO_SAMPLES"
+                continue
+            
+            # Train model
+            logger.info("Training model...")
+            use_ensemble = config.get('model', {}).get('use_ensemble', True)
+            model, scaler, metrics = trainer.train_model(
+                features_df=features_df,
+                labels=labels,
+                test_size=0.2,
+                validation_size=0.2,
+                use_ensemble=use_ensemble
+            )
+            
+            # Store metadata
+            trainer.trained_symbols = [symbol]
+            trainer.training_days = min(available_days, target_history_days)
+            trainer.symbol_history_days = {symbol: trainer.training_days}
+            trainer.training_end_timestamp = df['timestamp'].max()
+            trainer.min_history_days_per_symbol = min_history_days
+            
+            # Save model
+            logger.info("Saving model...")
+            version = config.get('model', {}).get('version', '1.0')
+            trainer.save_model(
+                model=model,
+                scaler=scaler,
+                metrics=metrics,
+                features_df=features_df,
+                version=version
+            )
+            
+            logger.info(f"✓ {symbol} trained successfully")
+            results[symbol] = "SUCCESS"
+            successful_symbols.append(symbol)
+            
+        except Exception as e:
+            logger.error(f"✗ Error training {symbol}: {e}", exc_info=True)
+            results[symbol] = "ERROR"
+    
+    # Remove successfully trained symbols from queue
+    if successful_symbols:
+        remaining_symbols = [s for s in queued_symbols if s not in successful_symbols]
+        queue['queued_symbols'] = remaining_symbols
+        
+        # Remove from queued_at as well
+        for symbol in successful_symbols:
+            queue['queued_at'].pop(symbol, None)
+        
+        try:
+            with open(queue_path, 'w') as f:
+                json.dump(queue, f, indent=2)
+            logger.info(f"\nRemoved {len(successful_symbols)} successfully trained symbol(s) from queue")
+            if remaining_symbols:
+                logger.info(f"Remaining in queue: {remaining_symbols}")
+        except Exception as e:
+            logger.warning(f"Could not update queue file: {e}")
+    
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Retrain and rotate models')
+    parser = argparse.ArgumentParser(description='Retrain and rotate models, and process training queue')
     parser.add_argument('--symbols', nargs='+', help='Symbols to retrain (default: from config)')
-    parser.add_argument('--dry-run', action='store_true', help='Dry run mode (no actual rotation)')
+    parser.add_argument('--dry-run', action='store_true', help='Dry run mode (no actual rotation or training)')
     parser.add_argument('--config', type=str, default='config/config.yaml', help='Config file')
+    parser.add_argument('--skip-queue', action='store_true', help='Skip processing training queue')
     
     args = parser.parse_args()
     
@@ -377,35 +565,55 @@ def main():
     # Load config
     config = load_config(args.config)
     
-    # Get symbols
+    # Process training queue first (if enabled and not skipped)
+    queue_results = {}
+    auto_train = config.get('model', {}).get('auto_train_new_symbols', True)
+    if auto_train and not args.skip_queue:
+        queue_results = process_training_queue(config, dry_run=args.dry_run)
+    elif not auto_train:
+        logger.info("Auto-training of new symbols is disabled in config")
+    elif args.skip_queue:
+        logger.info("Skipping training queue processing (--skip-queue flag)")
+    
+    # Get symbols for retraining
     if args.symbols:
         symbols = args.symbols
     else:
-        symbols = config['trading']['symbols']
+        symbols = config.get('trading', {}).get('symbols', [])
     
     # Initialize rotation manager
     rotation_manager = ModelRotationManager(config)
     
-    if not rotation_manager.enabled:
+    retrain_results = {}
+    if rotation_manager.enabled:
+        # Retrain each symbol
+        for symbol in symbols:
+            try:
+                rotated = rotation_manager.retrain_and_rotate(symbol, dry_run=args.dry_run)
+                retrain_results[symbol] = "ROTATED" if rotated else "SKIPPED"
+            except Exception as e:
+                logger.error(f"Error retraining {symbol}: {e}")
+                retrain_results[symbol] = "ERROR"
+    else:
         logger.warning("Model rotation is disabled in config")
-        return 0
-    
-    # Retrain each symbol
-    results = {}
-    for symbol in symbols:
-        try:
-            rotated = rotation_manager.retrain_and_rotate(symbol, dry_run=args.dry_run)
-            results[symbol] = "ROTATED" if rotated else "SKIPPED"
-        except Exception as e:
-            logger.error(f"Error retraining {symbol}: {e}")
-            results[symbol] = "ERROR"
     
     # Summary
     logger.info("=" * 60)
-    logger.info("Retraining Summary")
+    logger.info("Training Summary")
     logger.info("=" * 60)
-    for symbol, status in results.items():
-        logger.info(f"{symbol}: {status}")
+    
+    if queue_results:
+        logger.info("\nNew Symbol Training:")
+        for symbol, status in queue_results.items():
+            logger.info(f"  {symbol}: {status}")
+    
+    if retrain_results:
+        logger.info("\nModel Retraining:")
+        for symbol, status in retrain_results.items():
+            logger.info(f"  {symbol}: {status}")
+    
+    if not queue_results and not retrain_results:
+        logger.info("No training performed (queue empty and retraining disabled or no symbols)")
     
     return 0
 
