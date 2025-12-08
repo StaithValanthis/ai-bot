@@ -3,6 +3,7 @@
 import json
 import joblib
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
@@ -125,25 +126,25 @@ class MetaPredictor:
             return 0.0
         
         try:
-            # Convert features dict to array
+            # Determine feature names that the scaler expects
             if self.feature_names:
                 # Use feature names from config
-                feature_array = np.array([
-                    features.get(name, 0.0) for name in self.feature_names
-                ]).reshape(1, -1)
+                feature_names = self.feature_names
             else:
                 # Infer feature names from model
                 if hasattr(self.model, 'feature_names_in_'):
-                    feature_names = self.model.feature_names_in_
-                    feature_array = np.array([
-                        features.get(name, 0.0) for name in feature_names
-                    ]).reshape(1, -1)
+                    feature_names = list(self.model.feature_names_in_)
                 else:
-                    # Fallback: use all features in dict
-                    feature_array = np.array([list(features.values())]).reshape(1, -1)
+                    # Fallback: use all features in dict (order may not match training)
+                    feature_names = list(features.keys())
             
-            # Scale features
-            feature_array_scaled = self.scaler.transform(feature_array)
+            # Convert features dict to DataFrame with correct column names
+            # This ensures the scaler receives data in the same format it was trained on
+            feature_values = [features.get(name, 0.0) for name in feature_names]
+            feature_df = pd.DataFrame([feature_values], columns=feature_names)
+            
+            # Scale features (scaler expects DataFrame with column names)
+            feature_array_scaled = self.scaler.transform(feature_df)
             
             # Predict probability
             if hasattr(self.model, 'predict_proba'):

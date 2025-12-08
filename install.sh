@@ -699,6 +699,18 @@ try:
     config['model']['min_history_coverage_pct'] = 0.95
     config['model']['block_short_history_symbols'] = True
     
+    # Set optimized crypto trading parameters
+    config['model']['confidence_threshold'] = 0.30  # Optimized for crypto (was 0.45)
+    
+    # Ensure risk section exists
+    if 'risk' not in config:
+        config['risk'] = {}
+    
+    # Set optimized risk parameters for crypto
+    config['risk']['stop_loss_pct'] = 0.015  # 1.5% stop loss (optimized for crypto, was 2.0%)
+    config['risk']['take_profit_pct'] = 0.035  # 3.5% take profit (optimized for crypto, was 3.0%)
+    config['risk']['position_cooldown_hours'] = 8  # 8 hours (optimized for crypto, was 12h)
+    
     # Write back
     with open(config_path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
@@ -714,6 +726,10 @@ try:
     print(f"  model.symbol_encoding={symbol_encoding}")
     if training_mode == 'multi_symbol' and multi_symbol_symbols:
         print(f"  model.multi_symbol_symbols={multi_symbol_symbols}")
+    print(f"  model.confidence_threshold=0.30 (optimized for crypto)")
+    print(f"  risk.stop_loss_pct=0.015 (1.5%, optimized for crypto)")
+    print(f"  risk.take_profit_pct=0.035 (3.5%, optimized for crypto)")
+    print(f"  risk.position_cooldown_hours=8 (optimized for crypto)")
 except Exception as e:
     print(f"Warning: Could not update config.yaml: {e}", file=sys.stderr)
     sys.exit(1)

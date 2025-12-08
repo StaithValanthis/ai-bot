@@ -22,6 +22,8 @@ class RiskManager:
         self.max_drawdown = self.config.get('max_drawdown', 0.15)
         self.max_open_positions = self.config.get('max_open_positions', 3)
         self.base_position_size = self.config.get('base_position_size', 0.02)
+        self.risk_per_trade_pct = self.config.get('risk_per_trade_pct', 0.015)  # 1.5% base risk per trade
+        self.stop_loss_pct = self.config.get('stop_loss_pct', 0.015)  # 1.5% stop loss
         
         # Track daily PnL
         self.daily_pnl = 0.0
@@ -68,22 +70,42 @@ class RiskManager:
         current_volatility: Optional[float] = None
     ) -> float:
         """
-        Calculate position size based on risk parameters.
+        Calculate position size based on risk parameters (risk-based sizing).
+        
+        Uses risk-based position sizing where:
+        - Target Risk = 0.9% - 2.0% of equity (scales with confidence)
+        - Position Value = Target Risk / Stop Loss %
+        - Quantity = Position Value / Entry Price
+        
+        This ensures each trade risks 1-2% of equity, regardless of position size.
         
         Args:
             equity: Account equity
             signal_confidence: Meta-model confidence (0.0 to 1.0)
             entry_price: Entry price
+            current_volatility: Optional volatility for volatility targeting
             
         Returns:
-            Position size in base currency (e.g., BTC quantity)
+            Position size in base currency (e.g., token quantity)
         """
-        # Base position size
-        base_size_pct = self.base_position_size
+        # Get stop loss percentage
+        stop_loss_pct = self.config.get('stop_loss_pct', 0.015)
         
-        # Scale by confidence
-        confidence_multiplier = signal_confidence
-        adjusted_size_pct = base_size_pct * confidence_multiplier
+        # Target risk per trade (scaled by confidence)
+        # Base risk: 1.0% of equity (configurable via risk_per_trade_pct)
+        base_risk_pct = self.config.get('risk_per_trade_pct', 0.01)  # 1.0% default
+        
+        # Scale risk by confidence (higher confidence = higher risk)
+        # With base_risk_pct = 0.01: Confidence 0.3 -> 0.6% risk, Confidence 0.5 -> 1.0% risk, Confidence 1.0 -> 1.33% risk
+        min_risk_pct = base_risk_pct * 0.6  # 0.6% minimum (with 1.0% base)
+        max_risk_pct = base_risk_pct * 1.33  # 1.33% maximum (with 1.0% base)
+        target_risk_pct = min_risk_pct + (max_risk_pct - min_risk_pct) * signal_confidence
+        
+        # Calculate position value based on risk
+        # Risk = Position Value * Stop Loss
+        # Position Value = Risk / Stop Loss
+        target_risk_amount = equity * target_risk_pct
+        position_value = target_risk_amount / stop_loss_pct
         
         # Volatility targeting (if enabled and volatility provided)
         volatility_config = self.config.get('volatility_targeting', {})
@@ -91,19 +113,24 @@ class RiskManager:
             target_vol = volatility_config.get('target_volatility', 0.01)
             max_mult = volatility_config.get('max_multiplier', 2.0)
             vol_multiplier = min(target_vol / current_volatility if current_volatility > 0 else 1.0, max_mult)
-            adjusted_size_pct *= vol_multiplier
+            position_value *= vol_multiplier
             logger.debug(f"Volatility multiplier: {vol_multiplier:.2f} (vol: {current_volatility:.4f}, target: {target_vol:.4f})")
         
-        # Cap at max position size
-        adjusted_size_pct = min(adjusted_size_pct, self.max_position_size)
+        # Cap at max position size (as percentage of equity)
+        max_position_value = equity * self.max_position_size
+        position_value = min(position_value, max_position_value)
         
-        # Calculate position value
-        position_value = equity * adjusted_size_pct
+        # Convert to quantity (quantity = value / price)
+        quantity = position_value / entry_price if entry_price > 0 else 0
         
-        # Convert to quantity (assuming USDT perp, so quantity = value / price)
-        quantity = position_value / entry_price
+        # Calculate actual risk for logging
+        actual_risk_pct = (position_value * stop_loss_pct) / equity if equity > 0 else 0
         
-        logger.debug(f"Position size: {quantity:.6f} (confidence: {signal_confidence:.2f}, size_pct: {adjusted_size_pct:.2%})")
+        logger.debug(
+            f"Position size: {quantity:.6f} (confidence: {signal_confidence:.2f}, "
+            f"target_risk: {target_risk_pct:.2%}, actual_risk: {actual_risk_pct:.2%}, "
+            f"position_value: ${position_value:.2f})"
+        )
         
         return quantity
     
@@ -112,7 +139,8 @@ class RiskManager:
         equity: float,
         open_positions: List[Dict],
         symbol: str,
-        proposed_size: float
+        proposed_size: float,
+        entry_price: Optional[float] = None
     ) -> Tuple[bool, str]:
         """
         Check if proposed trade violates risk limits.
@@ -121,7 +149,8 @@ class RiskManager:
             equity: Account equity
             open_positions: List of open positions
             symbol: Trading symbol
-            proposed_size: Proposed position size
+            proposed_size: Proposed position size in tokens (quantity)
+            entry_price: Entry price per token (required for position value calculation)
             
         Returns:
             Tuple of (is_allowed, reason)
@@ -141,9 +170,15 @@ class RiskManager:
             return False, f"Max open positions reached: {len(open_positions)}"
         
         # Check position size
-        position_value = proposed_size * equity  # Simplified
-        if position_value > equity * self.max_position_size:
-            return False, f"Position size exceeds limit: {position_value:.2f}"
+        # proposed_size is in tokens (quantity), not a percentage
+        # Position value = quantity × price
+        if entry_price is None or entry_price <= 0:
+            return False, f"Invalid entry price for position size check: {entry_price}"
+        
+        position_value = proposed_size * entry_price  # Correct: tokens × price = USD value
+        max_position_value = equity * self.max_position_size
+        if position_value > max_position_value:
+            return False, f"Position size exceeds limit: ${position_value:.2f} > ${max_position_value:.2f} (max {self.max_position_size:.1%} of equity)"
         
         # Check if already have position in this symbol
         for pos in open_positions:

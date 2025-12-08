@@ -38,6 +38,11 @@ class HealthMonitor:
         self.api_error_window_minutes = ops_config.get('api_error_window_minutes', 10)
         self.max_no_trade_hours = ops_config.get('max_no_trade_hours', 168)  # 7 days
         
+        # Get candle interval from config (default: 60 minutes for hourly candles)
+        # This is used to calculate expected gaps between closed candles
+        # The bot uses hourly candles ("60" = 60 minutes), so we default to that
+        self.candle_interval_minutes = 60  # Default to hourly candles
+        
         logger.info(f"Initialized HealthMonitor (status file: {self.status_file_path})")
     
     def update_candle(self, symbol: str, timestamp: datetime):
@@ -111,11 +116,18 @@ class HealthMonitor:
             status['warnings'].append("No candle data received yet (startup)")
         else:
             # Check for stalled data feeds
+            # Account for candle interval: for hourly candles, gaps up to ~65 minutes are normal
+            # (allowing for delay in candle closing and processing)
+            expected_gap_minutes = self.candle_interval_minutes
+            tolerance_minutes = max(5, expected_gap_minutes * 0.1)  # 10% tolerance or 5 minutes minimum
+            max_allowed_gap = expected_gap_minutes + tolerance_minutes
+            
             for symbol, last_time in self.last_candle_time.items():
                 if last_time:
                     gap_minutes = (now - last_time).total_seconds() / 60
-                    if gap_minutes > self.max_candle_gap_minutes:
-                        status['issues'].append(f"Data feed stalled for {symbol}: {gap_minutes:.1f} minutes")
+                    # Only flag as stalled if gap exceeds expected interval + tolerance
+                    if gap_minutes > max_allowed_gap:
+                        status['issues'].append(f"Data feed stalled for {symbol}: {gap_minutes:.1f} minutes (expected: ~{expected_gap_minutes:.0f} min)")
                         status['health_status'] = 'DEGRADED'
                         data_feed_ok = False
         

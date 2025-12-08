@@ -19,7 +19,9 @@ class LiveDataStream:
         symbols: list,
         interval: str = "60",  # 60 = 1 hour
         testnet: bool = True,
-        callback: Optional[Callable] = None
+        callback: Optional[Callable] = None,
+        preview_callback: Optional[Callable] = None,
+        preview_throttle: int = 10  # Show preview every N open candle updates
     ):
         """
         Initialize live data stream.
@@ -28,15 +30,20 @@ class LiveDataStream:
             symbols: List of trading symbols to subscribe to
             interval: Kline interval ("60" = 1h, "240" = 4h)
             testnet: Use testnet WebSocket
-            callback: Callback function for new candles (receives DataFrame)
+            callback: Callback function for closed candles (receives DataFrame)
+            preview_callback: Optional callback for open candle previews (receives DataFrame)
+            preview_throttle: Show preview every N open candle updates (default: 10, roughly every 30-60 seconds)
         """
         self.symbols = symbols
         self.interval = interval
         self.testnet = testnet
         self.callback = callback
+        self.preview_callback = preview_callback
+        self.preview_throttle = preview_throttle
         self.ws = None
         self.running = False
         self.candle_buffer = {}  # Store latest candle per symbol
+        self._preview_count = {}  # Track preview calls per symbol (to throttle)
         
         # Determine WebSocket URL
         if testnet:
@@ -89,8 +96,38 @@ class LiveDataStream:
                     return
                 
                 # Convert to DataFrame format
+                candle_timestamp = pd.to_datetime(int(kline['start']), unit='ms')
+                
+                # Check for closed candle indicator
+                # Bybit WebSocket uses 'confirm' field: True when candle is closed, False when still updating
+                is_closed_from_message = kline.get('confirm', False)
+                
+                # Fallback: Detect closed candles by timestamp
+                # For hourly candles: a candle closes at the start of the next hour
+                # Example: 21:00 candle closes at 22:00:00
+                is_closed_from_timestamp = False
+                if not is_closed_from_message:
+                    try:
+                        # Parse interval to minutes (e.g., "60" = 60 minutes)
+                        interval_minutes = int(self.interval)
+                        # Calculate candle end time (start + interval)
+                        # For hourly candles: 21:00 candle ends at 22:00:00
+                        candle_end_time = candle_timestamp + pd.Timedelta(minutes=interval_minutes)
+                        
+                        # Get current time with proper timezone handling
+                        now = pd.Timestamp.now(tz=candle_timestamp.tz) if candle_timestamp.tz else pd.Timestamp.now()
+                        # If current time is past the candle's end time (with a 5-second buffer), it's considered closed
+                        is_closed_from_timestamp = now >= (candle_end_time + pd.Timedelta(seconds=5))
+                    except (ValueError, TypeError) as e:
+                        # If interval parsing fails, fall back to confirm field only
+                        logger.debug(f"Could not parse interval for timestamp fallback: {e}")
+                        pass
+                
+                # Use confirm field if available, otherwise use timestamp fallback
+                is_closed = is_closed_from_message or is_closed_from_timestamp
+                
                 candle = {
-                    'timestamp': pd.to_datetime(int(kline['start']), unit='ms'),
+                    'timestamp': candle_timestamp,
                     'open': float(kline['open']),
                     'high': float(kline['high']),
                     'low': float(kline['low']),
@@ -99,25 +136,45 @@ class LiveDataStream:
                     'turnover': float(kline.get('turnover', 0)),
                     'symbol': symbol,
                     'timeframe': self.interval,
-                    'is_closed': kline.get('confirm', False)  # True when candle closes
+                    'is_closed': is_closed
                 }
+                
+                # Log kline message structure for debugging (first message per symbol)
+                if not hasattr(self, '_kline_structure_logged'):
+                    self._kline_structure_logged = set()
+                if symbol not in self._kline_structure_logged:
+                    logger.debug(
+                        f"Kline message structure for {symbol}: "
+                        f"confirm={kline.get('confirm', 'N/A')}, "
+                        f"start={kline.get('start', 'N/A')}, "
+                        f"is_closed_from_message={is_closed_from_message}, "
+                        f"is_closed_from_timestamp={is_closed_from_timestamp}, "
+                        f"final_is_closed={is_closed}, "
+                        f"candle_timestamp={candle_timestamp}, "
+                        f"interval={self.interval}"
+                    )
+                    self._kline_structure_logged.add(symbol)
                 
                 # Update buffer
                 self.candle_buffer[symbol] = candle
                 
-                # Log all closed candles (for debugging - can reduce later)
+                # Process closed candles (these trigger signal evaluation and trading)
                 if candle['is_closed']:
                     logger.info(f"Closed candle for {symbol}: {candle['close']:.2f} @ {candle['timestamp']}")
                     if self.callback:
                         df = pd.DataFrame([candle])
                         self.callback(df)
                 else:
-                    # Log open candle updates occasionally (every 10th update per symbol)
-                    if not hasattr(self, '_open_candle_count'):
-                        self._open_candle_count = {}
-                    self._open_candle_count[symbol] = self._open_candle_count.get(symbol, 0) + 1
-                    if self._open_candle_count[symbol] % 10 == 0:
-                        logger.debug(f"Open candle update for {symbol}: {candle['close']:.2f}")
+                    # Open candle updates: show preview of potential trades (throttled)
+                    if self.preview_callback:
+                        # Throttle previews: show every N updates per symbol (configurable via preview_throttle)
+                        if symbol not in self._preview_count:
+                            self._preview_count[symbol] = 0
+                        self._preview_count[symbol] += 1
+                        
+                        if self._preview_count[symbol] % self.preview_throttle == 0:
+                            df = pd.DataFrame([candle])
+                            self.preview_callback(df)
         
         except KeyError as e:
             # Log more details about the message structure for debugging

@@ -13,8 +13,9 @@ import signal
 # Removed: threading and subprocess imports (no longer needed - training is external)
 from pathlib import Path
 import json
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+import bisect
 from loguru import logger
 import pandas as pd
 
@@ -88,7 +89,9 @@ class TradingBot:
         self.bybit_client = BybitClient(
             api_key=exchange_config['api_key'],
             api_secret=exchange_config['api_secret'],
-            testnet=exchange_config.get('testnet', True)
+            testnet=exchange_config.get('testnet', True),
+            timeout=exchange_config.get('api_timeout', 30),
+            max_retries=exchange_config.get('api_max_retries', 3)
         )
         
         # Set leverage for all trading symbols (non-blocking)
@@ -117,6 +120,10 @@ class TradingBot:
         self.candle_data = {}  # Store candles per symbol
         self.positions = {}  # Track open positions
         self.symbol_confidence_cache = {}  # Cache recent model confidence per symbol
+        self.symbol_last_trade_time = {}  # Track last trade time per symbol for cooldown
+        self.processed_candle_timestamps = {}  # Track processed candle timestamps per symbol (for deduplication)
+        self.last_preview_timestamp = {}  # Track last preview timestamp per symbol (to avoid repeated previews)
+        self.signal_queue = []  # Queue of signals waiting to be executed (ranked by confidence)
         
         # Symbol state tracking (simplified - no training in trading bot)
         self.tradable_symbols = set()  # Symbols that can be traded (trained + meet requirements)
@@ -406,7 +413,7 @@ class TradingBot:
         if new_symbols:
             queue_data['queued_symbols'] = list(existing_symbols | symbols)
             for symbol in new_symbols:
-                queue_data['queued_at'][symbol] = datetime.utcnow().isoformat()
+                queue_data['queued_at'][symbol] = datetime.now(timezone.utc).isoformat()
             
             try:
                 with open(queue_path, 'w') as f:
@@ -447,7 +454,29 @@ class TradingBot:
         symbol = df['symbol'].iloc[0]
         timestamp = df['timestamp'].iloc[0]
         
-        logger.info(f"New candle for {symbol}: {timestamp} | Close: {df['close'].iloc[0]}")
+        # Deduplication: Skip if we've already processed this candle timestamp
+        if symbol not in self.processed_candle_timestamps:
+            self.processed_candle_timestamps[symbol] = set()
+        
+        # Convert timestamp to a comparable format (use the start of the candle as the key)
+        if isinstance(timestamp, pd.Timestamp):
+            timestamp_key = timestamp.floor('h')  # Floor to hour for hourly candles
+        else:
+            timestamp_key = pd.to_datetime(timestamp).floor('h')
+        
+        # Check if we've already processed this candle
+        if timestamp_key in self.processed_candle_timestamps[symbol]:
+            logger.debug(f"[{symbol}] Skipping duplicate candle: {timestamp_key}")
+            return
+        
+        # Mark this candle as processed
+        self.processed_candle_timestamps[symbol].add(timestamp_key)
+        
+        # Keep only last 100 processed timestamps to limit memory
+        if len(self.processed_candle_timestamps[symbol]) > 100:
+            # Remove oldest timestamps (keep most recent 100)
+            sorted_timestamps = sorted(self.processed_candle_timestamps[symbol])
+            self.processed_candle_timestamps[symbol] = set(sorted_timestamps[-100:])
         
         # Update candle data
         if symbol not in self.candle_data:
@@ -474,10 +503,70 @@ class TradingBot:
         # Process signal (callback is only called for closed candles by WebSocket handler)
         # The WebSocket handler in live_data.py only calls callback when is_closed=True
         # So by the time we get here, the candle should be closed
-        self._process_signal(symbol)
+        # Log only when processing signal (reduces log spam)
+        logger.info(f"[{symbol}] Closed candle received: {timestamp} | Close: {df['close'].iloc[0]:.2f} - Processing signal...")
+        self._process_signal(symbol, is_preview=False)
     
-    def _process_signal(self, symbol: str):
-        """Process trading signal for a symbol"""
+    def _preview_signal(self, df: pd.DataFrame):
+        """Preview potential trade based on open candle (does not execute trades)"""
+        if df.empty:
+            return
+        
+        symbol = df['symbol'].iloc[0]
+        timestamp = df['timestamp'].iloc[0]
+        
+        # Only preview tradable symbols
+        if not self.is_symbol_tradable(symbol):
+            return
+        
+        # Deduplication: Skip if we've previewed this candle recently (within last 2 minutes)
+        # This prevents showing the same preview repeatedly for the same open candle
+        # Note: WebSocket already throttles previews (every 10 updates), but this adds extra protection
+        if symbol in self.last_preview_timestamp:
+            last_preview = self.last_preview_timestamp[symbol]
+            if isinstance(timestamp, pd.Timestamp):
+                timestamp_dt = timestamp
+            else:
+                timestamp_dt = pd.to_datetime(timestamp)
+            
+            time_diff = (timestamp_dt - last_preview).total_seconds()
+            if time_diff < 120:  # 2 minutes
+                return  # Skip preview if shown recently
+        
+        # Update last preview timestamp
+        if isinstance(timestamp, pd.Timestamp):
+            self.last_preview_timestamp[symbol] = timestamp
+        else:
+            self.last_preview_timestamp[symbol] = pd.to_datetime(timestamp)
+        
+        # Need to build a temporary DataFrame with the open candle for evaluation
+        # Use existing candle data if available, or create minimal context
+        if symbol not in self.candle_data:
+            # Load historical context for preview
+            self.candle_data[symbol] = self._load_historical_context(symbol)
+        
+        # Create a temporary DataFrame with the open candle appended
+        temp_df = pd.concat([
+            self.candle_data[symbol],
+            df
+        ], ignore_index=True).tail(500).reset_index(drop=True)
+        
+        if len(temp_df) < 50:  # Need enough history
+            return
+        
+        # Evaluate signal (preview mode - no trading)
+        self._process_signal(symbol, is_preview=True, preview_df=temp_df, preview_timestamp=timestamp)
+    
+    def _process_signal(self, symbol: str, is_preview: bool = False, preview_df: Optional[pd.DataFrame] = None, preview_timestamp: Optional[datetime] = None):
+        """
+        Process trading signal for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            is_preview: If True, only evaluate and log (no trading)
+            preview_df: Optional DataFrame to use for preview (instead of self.candle_data)
+            preview_timestamp: Optional timestamp for preview logging
+        """
         # Check if symbol is tradable (simplified check)
         if not self.is_symbol_tradable(symbol):
             # Log occasionally to avoid spam
@@ -489,13 +578,18 @@ class TradingBot:
                     logger.debug(f"Symbol {symbol} is not in tradable set")
             return
         
-        if symbol not in self.candle_data:
-            return
-        
-        df = self.candle_data[symbol]
+        # Use preview_df if provided, otherwise use cached candle data
+        if preview_df is not None:
+            df = preview_df
+        else:
+            if symbol not in self.candle_data:
+                return
+            df = self.candle_data[symbol]
         
         if len(df) < 50:  # Need enough history
             return
+        
+        preview_prefix = "👁️  PREVIEW: " if is_preview else ""
         
         try:
             # Calculate features
@@ -504,19 +598,25 @@ class TradingBot:
             # Generate primary signal
             primary_signal = self.primary_signal_gen.generate_signal(df_with_features)
             
-            # Log signal generation for visibility
+            # Always log non-neutral signals as potential trades (symbol + direction)
             if primary_signal['direction'] == 'NEUTRAL':
-                # Log occasionally to show the bot is evaluating signals
-                import random
-                if random.random() < 0.05:  # 5% chance to log NEUTRAL signals (reduce spam)
-                    logger.debug(f"[{symbol}] Signal evaluation: NEUTRAL (no trend signal detected)")
+                # Log occasionally to show the bot is evaluating signals (only for real trades, not previews)
+                if not is_preview:
+                    import random
+                    if random.random() < 0.05:  # 5% chance to log NEUTRAL signals (reduce spam)
+                        logger.debug(f"[{symbol}] Signal evaluation: NEUTRAL (no trend signal detected)")
                 return
             
-            # Log non-neutral signals (these are candidates for trading)
-            logger.info(
-                f"[{symbol}] ✓ Primary signal generated: {primary_signal['direction']} "
-                f"(strength: {primary_signal.get('strength', 'N/A')}) - Evaluating filters..."
-            )
+            # For preview mode: only log if trade passes all filters (silent evaluation)
+            # For real trades: log potential trade and filter results
+            current_price = df_with_features['close'].iloc[-1]
+            
+            if not is_preview:
+                # Log potential trade (always show symbol + direction when candle closes)
+                logger.info(
+                    f"[{symbol}] 🔍 Potential trade: {primary_signal['direction']} @ {current_price:.2f} "
+                    f"(strength: {primary_signal.get('strength', 'N/A')}) - Evaluating filters..."
+                )
             
             # Regime filter check
             regime_allowed, regime_reason, regime_multiplier = self.regime_filter.should_allow_trade(
@@ -525,7 +625,8 @@ class TradingBot:
             )
             
             if not regime_allowed:
-                logger.info(f"Signal filtered by regime: {regime_reason}")
+                if not is_preview:
+                    logger.info(f"[{symbol}] ❌ Filtered by regime filter: {regime_reason}")
                 return
             
             # Build meta-features (include symbol encoding for multi-symbol models)
@@ -566,7 +667,8 @@ class TradingBot:
                 
                 # Check if this symbol is selected
                 if not self.portfolio_selector.is_symbol_selected(symbol):
-                    logger.info(f"Symbol {symbol} not selected by portfolio selector. Skipping.")
+                    if not is_preview:
+                        logger.info(f"[{symbol}] ❌ Filtered by portfolio selector (not selected)")
                     return
             
             # Performance guard check
@@ -580,17 +682,18 @@ class TradingBot:
             guard_allowed, guard_reason = self.performance_guard.should_allow_trade()
             
             if not guard_allowed:
-                logger.warning(f"Trading paused by performance guard: {guard_reason}")
-                # Send alert
-                self.alert_manager.notify_event(
-                    event_type="PERFORMANCE_GUARD_PAUSED",
-                    message=f"Trading paused: {guard_reason}",
-                    context={
-                        'status': guard_status,
-                        'metrics': guard_metrics
-                    },
-                    severity="WARNING"
-                )
+                if not is_preview:
+                    logger.warning(f"[{symbol}] ❌ Filtered by performance guard: {guard_reason}")
+                    # Send alert (only for real trades, not previews)
+                    self.alert_manager.notify_event(
+                        event_type="PERFORMANCE_GUARD_PAUSED",
+                        message=f"Trading paused: {guard_reason}",
+                        context={
+                            'status': guard_status,
+                            'metrics': guard_metrics
+                        },
+                        severity="WARNING"
+                    )
                 return
             
             # Adjust confidence threshold based on performance guard
@@ -598,33 +701,46 @@ class TradingBot:
             confidence_adjustment = self.performance_guard.get_confidence_adjustment()
             adjusted_threshold = base_threshold + confidence_adjustment
             
-            # Log signal evaluation
-            logger.info(
-                f"[{symbol}] Signal evaluation: {primary_signal['direction']} | "
-                f"Confidence: {confidence:.3f} | "
-                f"Threshold: {adjusted_threshold:.3f} (base: {base_threshold:.3f} + adj: {confidence_adjustment:.3f}) | "
-                f"Regime: {regime_reason if 'regime_reason' in locals() else 'OK'}"
-            )
+            # Log confidence evaluation (only for real trades, not previews)
+            if not is_preview:
+                logger.info(
+                    f"[{symbol}] 📊 Confidence: {confidence:.3f} | "
+                    f"Threshold: {adjusted_threshold:.3f} "
+                    f"(base: {base_threshold:.3f} + adj: {confidence_adjustment:+.3f})"
+                )
             
-            # Log signal to trade logger
-            self.trade_logger.log_signal(
-                symbol=symbol,
-                direction=primary_signal['direction'],
-                confidence=confidence,
-                features=meta_features
-            )
+            # Log signal to trade logger (only for real trades, not previews)
+            if not is_preview:
+                self.trade_logger.log_signal(
+                    symbol=symbol,
+                    direction=primary_signal['direction'],
+                    confidence=confidence,
+                    features=meta_features
+                )
             
             # Check confidence threshold
             if confidence < adjusted_threshold:
-                logger.info(
-                    f"[{symbol}] Signal filtered: confidence {confidence:.3f} < threshold {adjusted_threshold:.3f} "
-                    f"(needs {adjusted_threshold - confidence:.3f} more confidence)"
-                )
+                if not is_preview:
+                    logger.info(
+                        f"[{symbol}] ❌ Filtered by confidence: {confidence:.3f} < {adjusted_threshold:.3f} "
+                        f"(needs {adjusted_threshold - confidence:.3f} more)"
+                    )
                 return
             
-            # Log that signal passed all filters and will attempt trade
+            # Log that signal passed all filters
+            if is_preview:
+                # Only log in preview mode if trade passes all filters
+                time_info = f" @ {preview_timestamp}" if preview_timestamp else ""
+                logger.info(
+                    f"👁️  PREVIEW: [{symbol}] ✅ WOULD EXECUTE TRADE: {primary_signal['direction']} "
+                    f"@ {df_with_features['close'].iloc[-1]:.2f}{time_info} "
+                    f"(confidence: {confidence:.3f}, strength: {primary_signal.get('strength', 'N/A')})"
+                )
+                return  # Don't execute trades in preview mode
+            
+            # Log that signal passed all filters
             logger.info(
-                f"[{symbol}] ✓ Signal passed all filters! Attempting trade: {primary_signal['direction']} "
+                f"[{symbol}] ✅ PASSED ALL FILTERS! Queueing trade: {primary_signal['direction']} "
                 f"@ {df_with_features['close'].iloc[-1]:.2f} (confidence: {confidence:.3f})"
             )
             
@@ -633,19 +749,108 @@ class TradingBot:
             if 'volatility' in df_with_features.columns:
                 current_volatility = df_with_features['volatility'].iloc[-1]
             
-            # Execute trade
-            self._execute_trade(
-                symbol=symbol,
-                direction=primary_signal['direction'],
-                confidence=confidence,
-                current_price=df_with_features['close'].iloc[-1],
-                current_volatility=current_volatility,
-                regime_multiplier=regime_multiplier
-            )
+            # Add to signal queue (ranked by confidence)
+            signal_entry = {
+                'symbol': symbol,
+                'direction': primary_signal['direction'],
+                'confidence': confidence,
+                'current_price': df_with_features['close'].iloc[-1],
+                'current_volatility': current_volatility,
+                'regime_multiplier': regime_multiplier,
+                'timestamp': datetime.now(timezone.utc),
+                'strength': primary_signal.get('strength', 0.0)
+            }
+            
+            # Insert in sorted order (highest confidence first)
+            # Sort by confidence descending, then by strength descending
+            queue_scores = [(-s['confidence'], -s.get('strength', 0)) for s in self.signal_queue]
+            new_score = (-confidence, -primary_signal.get('strength', 0))
+            insert_pos = bisect.bisect_left(queue_scores, new_score)
+            self.signal_queue.insert(insert_pos, signal_entry)
+            
+            logger.debug(f"[{symbol}] Added to signal queue (position {insert_pos + 1}/{len(self.signal_queue)}, confidence: {confidence:.3f})")
+            
+            # Process queue (try to execute highest confidence signals first)
+            self._process_signal_queue()
         
         except Exception as e:
             logger.error(f"Error processing signal for {symbol}: {e}")
             self.trade_logger.log_error("SIGNAL_PROCESSING", str(e))
+    
+    def _process_signal_queue(self):
+        """Process queued signals, executing highest confidence first"""
+        if not self.signal_queue:
+            return
+        
+        # Get current open positions
+        open_positions = self.bybit_client.get_positions()
+        max_positions = self.config['risk']['max_open_positions']
+        available_slots = max_positions - len(open_positions)
+        
+        if available_slots <= 0:
+            # No slots available - remove signals that can't be executed
+            logger.debug(f"Signal queue has {len(self.signal_queue)} signals, but {len(open_positions)}/{max_positions} positions are open")
+            # Keep queue for when slots become available
+            return
+        
+        # Process up to available_slots signals (highest confidence first)
+        executed_count = 0
+        remaining_queue = []
+        
+        for signal in self.signal_queue:
+            if executed_count >= available_slots:
+                # Keep remaining signals in queue
+                remaining_queue.append(signal)
+                continue
+            
+            # Try to execute this signal
+            try:
+                logger.info(
+                    f"[{signal['symbol']}] 🎯 Processing queued signal: {signal['direction']} "
+                    f"@ {signal['current_price']:.2f} (confidence: {signal['confidence']:.3f}, "
+                    f"queue position: {executed_count + 1})"
+                )
+                
+                # Execute trade
+                trade_successful = self._execute_trade(
+                    symbol=signal['symbol'],
+                    direction=signal['direction'],
+                    confidence=signal['confidence'],
+                    current_price=signal['current_price'],
+                    current_volatility=signal['current_volatility'],
+                    regime_multiplier=signal['regime_multiplier']
+                )
+                
+                # Only increment executed_count if trade was actually placed
+                if trade_successful:
+                    executed_count += 1
+                else:
+                    # Trade failed - remove from queue (unless it's a temporary issue like max positions)
+                    logger.debug(f"[{signal['symbol']}] Trade execution failed, removing from queue")
+                    continue
+                
+                # Check if we still have slots (position might have failed)
+                open_positions = self.bybit_client.get_positions()
+                available_slots = max_positions - len(open_positions)
+                if available_slots <= 0:
+                    # No more slots, keep remaining signals
+                    remaining_queue.extend(self.signal_queue[executed_count:])
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error executing queued signal for {signal['symbol']}: {e}")
+                # Remove failed signal from queue
+                continue
+        
+        # Update queue with remaining signals
+        self.signal_queue = remaining_queue
+        
+        if executed_count > 0:
+            logger.info(f"Executed {executed_count} signal(s) from queue. {len(self.signal_queue)} signal(s) remaining in queue")
+        
+        # Clean up old signals (older than 1 hour)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        self.signal_queue = [s for s in self.signal_queue if s['timestamp'] > cutoff_time]
     
     def _execute_trade(
         self,
@@ -655,16 +860,27 @@ class TradingBot:
         current_price: float,
         current_volatility: Optional[float] = None,
         regime_multiplier: float = 1.0
-    ):
-        """Execute a trade"""
+    ) -> bool:
+        """
+        Execute a trade
+        
+        Returns:
+            True if trade was successfully placed, False otherwise
+        """
         try:
             # Get account balance
             balance = self.bybit_client.get_account_balance()
             if not balance:
-                logger.error("Could not get account balance")
-                return
+                logger.error(f"[{symbol}] Could not get account balance - skipping trade")
+                return False
             
-            equity = balance['total_equity']
+            equity = balance.get('total_equity', 0.0)
+            if equity <= 0:
+                logger.warning(
+                    f"[{symbol}] ❌ Cannot execute trade: zero or negative equity "
+                    f"Balance response: {balance}. Cannot execute trades with zero balance."
+                )
+                return False
             
             # Update risk manager
             self.risk_manager.update_account_state(equity)
@@ -697,17 +913,118 @@ class TradingBot:
             
             logger.info(f"Position sizing: base={base_position_size:.6f}, guard_mult={guard_multiplier:.2f}, regime_mult={regime_multiplier:.2f}, final={final_position_size:.6f}")
             
-            # Check risk limits (use final position size)
+            # Validate position size before proceeding
+            # Bybit minimum order size is typically 0.001, but we'll use a slightly higher threshold for safety
+            min_order_size = 0.001  # Minimum order size for Bybit
+            
+            # Check for zero or negative position size (with small epsilon for floating point precision)
+            if final_position_size <= 0 or abs(final_position_size) < 1e-10:
+                logger.warning(
+                    f"[{symbol}] ❌ Cannot place order: position size is zero or negative "
+                    f"(final_size={final_position_size:.6f}, base={base_position_size:.6f}, "
+                    f"equity={equity:.2f}, price={current_price:.2f})"
+                )
+                return False
+            
+            # Check if position size is below minimum order size
+            if final_position_size < min_order_size:
+                logger.warning(
+                    f"[{symbol}] ❌ Cannot place order: position size below minimum "
+                    f"(final_size={final_position_size:.6f} < min={min_order_size}, "
+                    f"base={base_position_size:.6f}, equity={equity:.2f}, price={current_price:.2f})"
+                )
+                return False
+            
+            # Check risk limits (use final position size and current price)
             is_allowed, reason = self.risk_manager.check_risk_limits(
                 equity=equity,
                 open_positions=open_positions,
                 symbol=symbol,
-                proposed_size=final_position_size
+                proposed_size=final_position_size,
+                entry_price=current_price
             )
             
             if not is_allowed:
-                logger.warning(f"Trade not allowed: {reason}")
-                return
+                logger.warning(f"[{symbol}] Trade not allowed: {reason}")
+                # Remove signal from queue if it's a permanent issue (not max positions)
+                if "Max open positions" not in reason:
+                    self.signal_queue = [s for s in self.signal_queue if s['symbol'] != symbol]
+                return False
+            
+            # Check position cooldown (24 hours before re-entering same symbol)
+            position_cooldown_hours = self.config['risk'].get('position_cooldown_hours', 8)
+            if symbol in self.symbol_last_trade_time:
+                hours_since_last = (datetime.now(timezone.utc) - self.symbol_last_trade_time[symbol]).total_seconds() / 3600
+                if hours_since_last < position_cooldown_hours:
+                    logger.info(
+                        f"[{symbol}] ❌ Filtered by position cooldown: "
+                        f"{hours_since_last:.1f}h since last trade (need {position_cooldown_hours}h)"
+                    )
+                    return False
+            
+            # Store original position size before any adjustments
+            original_position_size = final_position_size
+            
+            # Get instrument info to check minimum notional and lot size
+            # Increase size if needed to meet exchange minimum (after risk check passes)
+            try:
+                instrument_info = self.bybit_client.session.get_instruments_info(
+                    category="linear",
+                    symbol=symbol
+                )
+                if instrument_info.get('retCode') == 0:
+                    result = instrument_info.get('result', {})
+                    if 'list' in result and len(result['list']) > 0:
+                        lot_size_filter = result['list'][0].get('lotSizeFilter', {})
+                        min_notional = float(lot_size_filter.get('minNotionalValue', '5.0'))
+                        qty_step = float(lot_size_filter.get('qtyStep', '0.001'))
+                        min_order_qty = float(lot_size_filter.get('minOrderQty', '0.001'))
+                        
+                        # Check if position value meets minimum notional
+                        position_value = final_position_size * current_price
+                        if position_value < min_notional:
+                            # Increase quantity to meet minimum
+                            min_qty_needed = min_notional / current_price
+                            # Round up to next qty_step
+                            increased_size = (int(min_qty_needed / qty_step) + 1) * qty_step
+                            
+                            # Check if increased size still passes risk limits
+                            is_allowed_increased, reason_increased = self.risk_manager.check_risk_limits(
+                                equity=equity,
+                                open_positions=open_positions,
+                                symbol=symbol,
+                                proposed_size=increased_size,
+                                entry_price=current_price
+                            )
+                            
+                            if is_allowed_increased or "exceeds limit" in reason_increased:
+                                # Allow it if original passed and we're only increasing for exchange minimum
+                                final_position_size = increased_size
+                                logger.info(
+                                    f"[{symbol}] ⚠️  Position size increased to meet minimum notional: "
+                                    f"{original_position_size:.6f} -> {final_position_size:.6f} "
+                                    f"(${position_value:.2f} -> ${final_position_size * current_price:.2f})"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[{symbol}] ❌ Cannot increase size to meet minimum: {reason_increased}"
+                                )
+                                return False
+                        
+                        # Ensure it meets minimum order quantity
+                        if final_position_size < min_order_qty:
+                            final_position_size = min_order_qty
+                            logger.info(f"[{symbol}] ⚠️  Position size adjusted to minimum order qty: {min_order_qty}")
+            except Exception as e:
+                logger.debug(f"[{symbol}] Could not check instrument info: {e}, using defaults")
+                # Final check: ensure position value meets minimum notional (fallback)
+                final_position_value = final_position_size * current_price
+                if final_position_value < 5.0:  # Bybit's typical minimum
+                    logger.warning(
+                        f"[{symbol}] ❌ Cannot place order: position value ${final_position_value:.2f} "
+                        f"below minimum notional $5.00 (size={final_position_size:.6f}, price={current_price:.2f})"
+                    )
+                    return False
             
             # Determine order side
             side = 'Buy' if direction == 'LONG' else 'Sell'
@@ -743,27 +1060,40 @@ class TradingBot:
                 )
                 
                 # Update health monitor
-                self.health_monitor.update_trade(datetime.utcnow())
+                self.health_monitor.update_trade(datetime.now(timezone.utc))
                 
                 # Track position
                 self.positions[symbol] = {
                     'entry_price': current_price,
                     'side': side,
                     'qty': final_position_size,
-                    'entry_time': datetime.utcnow(),
+                    'entry_time': datetime.now(timezone.utc),
                     'stop_loss': stop_loss,
                     'take_profit': take_profit
                 }
+                
+                # Record trade time for cooldown tracking
+                self.symbol_last_trade_time[symbol] = datetime.now(timezone.utc)
+                
+                logger.info(f"[{symbol}] ✅ Trade successfully placed: {side} {final_position_size:.6f} @ {current_price:.2f}")
+                return True
+            else:
+                logger.warning(f"[{symbol}] ❌ Order placement failed: order returned None")
+                return False
         
         except Exception as e:
-            logger.error(f"Error executing trade: {e}")
+            logger.error(f"[{symbol}] Error executing trade: {e}")
             self.trade_logger.log_error("TRADE_EXECUTION", str(e))
+            return False
     
     def _monitor_positions(self):
         """
         Monitor open positions and check exit conditions.
         Also reconciles with exchange state to handle positions closed externally.
         """
+        # Process signal queue when monitoring positions (in case slots opened up)
+        self._process_signal_queue()
+        
         try:
             open_positions = self.bybit_client.get_positions()
             exchange_positions_dict = {pos['symbol']: pos for pos in open_positions}
@@ -882,7 +1212,7 @@ class TradingBot:
                     qty=tracked['qty'],
                     pnl=pnl,
                     entry_time=tracked['entry_time'],
-                    exit_time=datetime.utcnow()
+                    exit_time=datetime.now(timezone.utc)
                 )
                 
                 # Update risk manager and performance guard
@@ -890,7 +1220,7 @@ class TradingBot:
                 self.performance_guard.record_trade(pnl, pnl > 0)
                 
                 # Update health monitor
-                self.health_monitor.update_trade(datetime.utcnow())
+                self.health_monitor.update_trade(datetime.now(timezone.utc))
                 
                 # Remove from tracking
                 del self.positions[symbol]
@@ -924,11 +1254,19 @@ class TradingBot:
         def on_candle(df):
             self._on_new_candle(df)
         
+        def on_preview(df):
+            self._preview_signal(df)
+        
+        # Preview throttle: show preview every N open candle updates (default: 10 = roughly every 30-60 seconds)
+        preview_throttle = self.config.get('operations', {}).get('preview_throttle', 10)
+        
         stream = LiveDataStream(
             symbols=symbols,
             interval="60",  # 1 hour
             testnet=self.config['exchange'].get('testnet', True),
-            callback=on_candle
+            callback=on_candle,
+            preview_callback=on_preview,
+            preview_throttle=preview_throttle
         )
         
         # Start WebSocket
@@ -942,7 +1280,7 @@ class TradingBot:
         logger.info(f"Bot running. Monitoring {len(symbols)} symbols: {symbols[:10]}{'...' if len(symbols) > 10 else ''}")
         logger.info("Press Ctrl+C to stop")
         logger.info("IMPORTANT: Hourly candles only close at the top of each hour (e.g., 09:00, 10:00, 11:00)")
-        logger.info("Signals are only processed when candles CLOSE. Open candle updates are received but not processed.")
+        logger.info("Trades execute when candles CLOSE. Preview signals shown for open candles (👁️ PREVIEW prefix).")
         
         # Initialize portfolio selector (if enabled)
         if self.portfolio_selector.enabled:
@@ -1072,12 +1410,26 @@ class TradingBot:
                     )
                     
                     # Log health check summary
-                    logger.info(
-                        f"Health check: status={health_status.get('health_status', 'UNKNOWN')}, "
+                    issues = health_status.get('issues', [])
+                    warnings = health_status.get('warnings', [])
+                    health_status_str = health_status.get('health_status', 'UNKNOWN')
+                    
+                    log_msg = (
+                        f"Health check: status={health_status_str}, "
                         f"positions={len(positions_dict)}, "
                         f"regime={regime_info.get('regime', 'UNKNOWN') if regime_info else 'N/A'}, "
                         f"guard={guard_info.get('status', 'UNKNOWN') if guard_info else 'N/A'}"
                     )
+                    
+                    if issues:
+                        log_msg += f", issues={issues}"
+                    if warnings:
+                        log_msg += f", warnings={warnings}"
+                    
+                    if health_status_str in ['DEGRADED', 'UNHEALTHY']:
+                        logger.warning(log_msg)
+                    else:
+                        logger.info(log_msg)
                     
                     # Write status file
                     self.health_monitor.write_status_file(health_status)
@@ -1145,4 +1497,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

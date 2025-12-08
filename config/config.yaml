@@ -4,13 +4,15 @@ exchange:
   testnet: true  # Use testnet for initial testing
   api_key: "${BYBIT_API_KEY}"  # From environment
   api_secret: "${BYBIT_API_SECRET}"  # From environment
+  api_timeout: 30  # Request timeout in seconds (increased from default 10s)
+  api_max_retries: 3  # Maximum retries for failed API requests
   
   # Universe Discovery & Filtering
   universe_mode: "fixed"  # "auto" for dynamic discovery, "fixed" for explicit list (DEFAULT: fixed for safety)
   fixed_symbols: []  # Used when universe_mode="fixed" (empty = use trading.symbols)
   
   # Universe filters (used when universe_mode="auto")
-  min_usd_volume_24h: 50000000  # Minimum $50M 24h volume (USD turnover)
+  min_usd_volume_24h: 50000000  # Minimum $50M 24h volume (USD turnover) - raised to $50M
   min_price: 0.05  # Minimum price per unit
   max_symbols: 30  # Maximum symbols to include after filtering
   
@@ -43,7 +45,7 @@ model:
   path: "models/meta_model_v1.0.joblib"
   scaler_path: "models/feature_scaler_v1.0.joblib"
   config_path: "models/model_config_v1.0.json"
-  confidence_threshold: 0.6
+  confidence_threshold: 0.40  # Raised from 0.30 (was 0.45 originally)
   use_ensemble: true  # Use ensemble (XGBoost + Logistic Regression baseline)
   ensemble_xgb_weight: 0.7  # Weight for XGBoost in ensemble (0.7 = 70% XGBoost, 30% baseline)
   
@@ -74,13 +76,15 @@ model:
 # Risk Management
 risk:
   max_leverage: 3.0
-  max_position_size: 0.10  # 10% of equity per position
-  max_daily_loss: 0.05  # 5% of equity per day
+  max_position_size: 0.67  # 66.7% max per position (increased to allow risk-based sizing)
+  max_daily_loss: 0.03  # 3% daily loss limit (reduced from 5%)
   max_drawdown: 0.15  # 15% from peak equity
-  max_open_positions: 3
-  base_position_size: 0.02  # 2% base size
-  stop_loss_pct: 0.02  # 2% stop loss
-  take_profit_pct: 0.03  # 3% take profit
+  max_open_positions: 3  # Max 3 simultaneous positions (reduced from 4)
+  base_position_size: 0.02  # 2% base position size (legacy, now using risk-based sizing)
+  risk_per_trade_pct: 0.01  # 1.0% base risk per trade (reduced from 1.5%, scales 0.6%-1.33% with confidence)
+  position_cooldown_hours: 8  # 8 hours before re-entering same symbol (optimized for crypto, was 12h)
+  stop_loss_pct: 0.015  # 1.5% stop loss (optimized for crypto, was 2.0%)
+  take_profit_pct: 0.035  # 3.5% take profit (optimized for crypto, was 3.0%)
   trailing_stop_activation: 0.01  # Activate trailing stop after 1% profit
   trailing_stop_distance: 0.01  # Trail stop 1% below peak
 
@@ -126,9 +130,9 @@ primary_signal:
 # Regime Filter (V2)
 regime_filter:
   enabled: true
-  adx_threshold: 25
+  adx_threshold: 20  # Raised from 25 (lower threshold = more lenient)
   volatility_threshold: 2.0  # 2x average ATR
-  allow_ranging: false  # Don't trade trend-following in ranging markets
+  allow_ranging: false  # Disabled - Don't trade trend-following in ranging markets
   high_vol_multiplier: 0.5  # Reduce size in high volatility
 
 # Performance Guard (V2)
@@ -171,7 +175,8 @@ operations:
   max_api_errors: 5  # Alert if 5+ errors in window
   api_error_window_minutes: 10
   max_no_trade_hours: 168  # 7 days - warn if no trades
-  
+  preview_throttle: 10  # Show preview every N open candle updates
+                        # Lower = more frequent (5 = ~15-30 sec), Higher = less frequent (20 = ~1-2 min)
   model_rotation:
     enabled: false  # Set to true to enable auto-retraining
     retrain_frequency_days: 30  # Retrain monthly
